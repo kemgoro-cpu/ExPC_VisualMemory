@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Visual Memory</title>
+  <link rel="stylesheet" href="/static/app.css?v={{ static_version }}">
+</head>
+<body data-max-pack-images="{{ max_pack_images }}" data-pack-warning-images="{{ pack_warning_images }}">
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">EXTERNAL PC</p>
+      <h1>Visual Memory</h1>
+    </div>
+    <div id="captureBadge" class="status-badge stopped"><span></span>停止中</div>
+  </header>
+
+  <main>
+    <section class="capture-panel surface">
+      <div class="section-heading">
+        <div><p class="eyebrow">CAPTURE</p><h2>入力</h2></div>
+        <button id="refreshDevices" class="ghost">デバイスを再検出</button>
+      </div>
+      <div class="capture-controls">
+        <label class="control-field device-field"><span>映像入力</span>
+          <select id="deviceSelect"><option value="">キャプチャーデバイスを選択</option></select>
+        </label>
+        <button id="startCapture" class="primary">記録を開始</button>
+        <button id="stopCapture" class="danger">停止</button>
+        <button id="regionSettings" class="ghost">差分領域</button>
+      </div>
+      <div id="systemWarnings" class="warnings"></div>
+      <div class="metrics" id="metrics"></div>
+    </section>
+
+    <section class="workspace">
+      <div class="history surface">
+        <div class="section-heading">
+          <div><p class="eyebrow">LOCAL HISTORY</p><h2>画面履歴</h2></div>
+          <button id="showPacks" class="ghost">コンテキスト文書</button>
+        </div>
+        <form id="searchForm" class="search-form">
+          <label class="control-field search-query"><span>キーワード</span>
+            <input id="searchQuery" type="search" placeholder="例：利益率のスライド、retry関数、再起動前のエラー">
+          </label>
+          <label class="control-field"><span>開始</span><input id="searchStart" type="datetime-local"></label>
+          <label class="control-field"><span>終了</span><input id="searchEnd" type="datetime-local"></label>
+          <button class="primary" type="submit">検索</button>
+        </form>
+        <div id="resultsMeta" class="muted"></div>
+        <div id="eventGrid" class="event-grid"></div>
+        <div class="load-more-wrap"><button id="loadMore" class="ghost" hidden>さらに読み込む</button></div>
+      </div>
+
+      <aside class="basket surface">
+        <p class="eyebrow">CONTEXT BASKET</p>
+        <h2>AIへ渡す候補</h2>
+        <p class="muted">上から順に文書化されます。ドラッグで並べ替えできます。</p>
+        <div id="basketSummary" class="basket-summary">0枚選択中</div>
+        <div class="basket-order-toolbar">
+          <button id="sortChronological" class="ghost" type="button">時系列順</button>
+          <button id="reverseOrder" class="ghost" type="button">逆順</button>
+        </div>
+        <div id="basketItems" class="basket-items"></div>
+        <label>タイトル<input id="packTitle" maxlength="200" placeholder="空欄なら画面から自動作成"></label>
+        <label>メモ<textarea id="packNote" rows="4" placeholder="AIに知っておいてほしいこと"></textarea></label>
+        <label class="option-check"><input id="deduplicateOverlaps" type="checkbox" checked>連続画面の重複を除去</label>
+        <button id="createPack" class="primary wide">コンテキスト文書を作成</button>
+        <small>{{ pack_warning_images }}枚を超える文書ではサイズ警告を表示します。</small>
+      </aside>
+    </section>
+  </main>
+
+  <dialog id="detailDialog" class="detail-dialog">
+    <button class="dialog-close" data-close="detailDialog" aria-label="詳細を閉じる">×</button>
+    <div id="detailContent"></div>
+  </dialog>
+
+  <dialog id="packsDialog" class="packs-dialog">
+    <button class="dialog-close" data-close="packsDialog" aria-label="文書一覧を閉じる">×</button>
+    <div class="section-heading"><div><p class="eyebrow">CONTEXT DOCUMENTS</p><h2>コンテキスト文書</h2></div></div>
+    <div id="packList"></div>
+  </dialog>
+
+  <dialog id="redactionDialog" class="redaction-dialog">
+    <button class="dialog-close" data-close="redactionDialog" aria-label="墨消し画面を閉じる">×</button>
+    <p class="eyebrow">REDACTION</p>
+    <h2>AIへ見せない範囲を黒塗り</h2>
+    <p class="muted">画像上をドラッグしてください。やり直す場合はクリアします。</p>
+    <div class="canvas-wrap"><canvas id="redactionCanvas"></canvas></div>
+    <div class="dialog-actions">
+      <button id="clearRedactions" class="ghost">クリア</button>
+      <button id="saveRedactions" class="primary">墨消しを保存</button>
+    </div>
+  </dialog>
+
+  <dialog id="regionDialog" class="redaction-dialog">
+    <button class="dialog-close" data-close="regionDialog" aria-label="差分領域画面を閉じる">×</button>
+    <p class="eyebrow">CHANGE DETECTION</p>
+    <h2>差分検出領域</h2>
+    <p class="muted">赤は時計・カーソルなどの無視領域、緑は小さな変更も保存する重要監視領域です。記録を停止してから設定してください。</p>
+    <div class="dialog-actions region-toolbar">
+      <label>描画モード
+        <select id="regionMode">
+          <option value="ignore">無視領域</option>
+          <option value="watch">重要監視領域</option>
+        </select>
+      </label>
+      <button id="clearIgnoreRegions" class="ghost">赤をクリア</button>
+      <button id="clearWatchRegions" class="ghost">緑をクリア</button>
+    </div>
+    <div class="canvas-wrap"><canvas id="regionCanvas"></canvas></div>
+    <div class="dialog-actions">
+      <button id="saveRegions" class="primary">領域を保存</button>
+    </div>
+  </dialog>
+
+  <div id="toast" class="toast" role="status"></div>
+  <script src="/static/app.js?v={{ static_version }}" defer></script>
+</body>
+</html>

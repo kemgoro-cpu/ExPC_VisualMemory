@@ -1,0 +1,7 @@
+{
+  "queries": [
+    {"query": "retry_request", "expected_event_id": 1, "kind": "exact"},
+    {"query": "利益率について説明したスライド", "expected_event_id": 2, "kind": "semantic"},
+    {"query": "再起動前に出ていたエラー", "expected_event_id": 3, "kind": "semantic"}
+  ]
+}
