@@ -104,3 +104,96 @@ def test_event_history_supports_incremental_paging(settings, service):
     assert {item["id"] for item in first["events"]}.isdisjoint(
         item["id"] for item in second["events"]
     )
+
+
+def test_query_token_is_only_accepted_on_root(settings, service):
+    app = create_app(settings, service)
+    with TestClient(app) as client:
+        assert client.get(f"/api/events?token={settings.auth_token}").status_code == 401
+        assert client.get(f"/?token={settings.auth_token}", follow_redirects=False).status_code == 303
+
+
+def test_delete_events_requires_bounded_range_and_confirmation(settings, service):
+    app = create_app(settings, service)
+    with TestClient(app) as client:
+        response = client.get(f"/?token={settings.auth_token}", follow_redirects=False)
+        client.cookies.update(response.cookies)
+        event_id = add_event(service, "delete me")
+        headers = {"X-CSRF-Token": settings.csrf_token}
+        assert client.delete("/api/events", headers=headers).status_code == 400
+        assert (
+            client.delete(
+                "/api/events?start=2026-01-01T00:00:00Z&end=2026-01-01T00:01:00Z",
+                headers=headers,
+            ).status_code
+            == 400
+        )
+        deleted = client.delete(
+            "/api/events?start=2026-01-01T00:00:00Z&end=2026-01-01T00:01:00Z&confirm=true",
+            headers=headers,
+        )
+
+    assert deleted.status_code == 200
+    assert deleted.json() == {"deleted": 1}
+    assert service.db.fetchone("SELECT id FROM screen_event WHERE id=?", (event_id,)) is None
+
+
+def test_event_can_be_reindexed_after_initial_ocr_failure(monkeypatch, settings, service):
+    original_recognize = service.processor.ocr.recognize
+
+    def fail_once(_frame):
+        raise RuntimeError("temporary OCR failure")
+
+    monkeypatch.setattr(service.processor.ocr, "recognize", fail_once)
+    app = create_app(settings, service)
+    with TestClient(app) as client:
+        response = client.get(f"/?token={settings.auth_token}", follow_redirects=False)
+        client.cookies.update(response.cookies)
+        event_id = add_event(service, "discarded after failure")
+        assert service.db.fetchone("SELECT processed_at FROM screen_event WHERE id=?", (event_id,))[
+            "processed_at"
+        ] is None
+
+        service.processor.ocr.texts.clear()
+        service.processor.ocr.texts.append("recovered OCR text")
+        monkeypatch.setattr(service.processor.ocr, "recognize", original_recognize)
+        reindexed = client.post(
+            f"/api/events/{event_id}/reindex",
+            headers={"X-CSRF-Token": settings.csrf_token},
+        )
+
+    assert reindexed.status_code == 200
+    assert reindexed.json()["event"]["ocr_text"] == "recovered OCR text"
+    assert service.search.search("recovered OCR text")[0]["id"] == event_id
+
+
+def test_reindex_does_not_erase_ocr_when_provider_is_unavailable(monkeypatch, settings, service):
+    app = create_app(settings, service)
+    with TestClient(app) as client:
+        response = client.get(f"/?token={settings.auth_token}", follow_redirects=False)
+        client.cookies.update(response.cookies)
+        event_id = add_event(service, "keep existing OCR")
+        monkeypatch.setattr(service.ocr, "available", False)
+        monkeypatch.setattr(service.ocr, "reason", "OCR model is unavailable")
+        response = client.post(
+            f"/api/events/{event_id}/reindex",
+            headers={"X-CSRF-Token": settings.csrf_token},
+        )
+
+    assert response.status_code == 409
+    assert service.db.fetchone("SELECT ocr_text FROM screen_event WHERE id=?", (event_id,))[
+        "ocr_text"
+    ] == "keep existing OCR"
+
+
+def test_ui_exposes_recovery_and_keyboard_controls(settings, service):
+    app = create_app(settings, service)
+    with TestClient(app) as client:
+        response = client.get(f"/?token={settings.auth_token}", follow_redirects=False)
+        client.cookies.update(response.cookies)
+        script = client.get("/static/app.js").text
+
+    assert 'tabindex="0" role="checkbox"' in script
+    assert "OCR・検索を再処理" in script
+    assert "文書を再生成" in script
+    assert "statusInterval = null" in script

@@ -252,6 +252,17 @@ def create_app(settings: Settings | None = None, service: VisualMemoryService | 
             raise HTTPException(404, "Event not found")
         return result
 
+    @app.post("/api/events/{event_id}/reindex")
+    def reindex_event(event_id: int):
+        if not service.ocr.available:
+            raise HTTPException(409, service.ocr.reason or "OCR is not available")
+        try:
+            return service.reindex_event(event_id)
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(500, f"Unable to re-index event: {exc}") from exc
+
     @app.get("/api/events/{event_id}/frame")
     def event_frame(event_id: int, thumbnail: bool = False):
         row = service.db.fetchone(

@@ -232,6 +232,8 @@ class FFmpegFrameSource:
 
     def frames(self, stop_event: threading.Event) -> Iterator[np.ndarray]:
         frame_size = self.settings.capture_width * self.settings.capture_height * 3
+        with self._stderr_lock:
+            self._stderr_tail.clear()
         self.process = subprocess.Popen(
             self.command(),
             stdout=subprocess.PIPE,
@@ -289,7 +291,14 @@ class FFmpegFrameSource:
                 self.process.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 self.process.kill()
+                self.process.wait(timeout=3)
+        for stream in (self.process.stdout, self.process.stderr):
+            if stream:
+                stream.close()
+        if self._stderr_thread and self._stderr_thread.is_alive():
+            self._stderr_thread.join(timeout=1)
         self.process = None
+        self._stderr_thread = None
 
 
 @dataclass(slots=True)

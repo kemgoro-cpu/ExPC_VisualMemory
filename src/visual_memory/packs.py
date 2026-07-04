@@ -529,9 +529,9 @@ class ContextPackService:
                 # expiry_hoursが明示されていない再ビルドは、既存の承認日時・期限を維持する
                 approved_at = datetime.fromisoformat(pack["approved_at"])
                 expires_at = datetime.fromisoformat(pack["expires_at"])
-            elif pack["status"] == "approved" and pack.get("approved_at") and expiry_hours is not None:
-                # expiry_hoursが明示された再承認は、元の承認日時を基準に新しい期限を計算する
-                approved_at = datetime.fromisoformat(pack["approved_at"])
+            elif pack["status"] == "approved" and expiry_hours is not None:
+                # 明示的な再承認は現在時刻から新しい承認期間を開始する
+                approved_at = utcnow()
                 expires_at = approved_at + timedelta(hours=hours)
             else:
                 approved_at = utcnow()

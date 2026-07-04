@@ -187,6 +187,8 @@ class VisualMemoryService:
         return True, None
 
     def delete_events(self, start: str | None = None, end: str | None = None) -> int:
+        if not start or not end:
+            raise ValueError("A bounded start and end time are required")
         conditions = ["id NOT IN (SELECT event_id FROM context_pack_item)"]
         params: list[str] = []
         if start:
@@ -207,6 +209,16 @@ class VisualMemoryService:
             [value for row in rows for value in (row["frame_path"], row["thumbnail_path"])]
         )
         return len(rows)
+
+    def reindex_event(self, event_id: int) -> dict[str, Any]:
+        if not self.ocr.available:
+            raise RuntimeError(self.ocr.reason or "OCR is not available")
+        self.processor.reprocess_one(event_id)
+        self.search.invalidate_embedding_cache()
+        result = self.search.event_with_neighbors(event_id)
+        if not result:
+            raise LookupError("Event not found")
+        return result
 
 
 def bitlocker_status(path: Path) -> dict[str, str]:

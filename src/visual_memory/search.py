@@ -171,7 +171,8 @@ class SearchEngine:
     def _embedding_cache(self, dimension: int) -> tuple[list[Any], np.ndarray | None]:
         signature_row = self.db.fetchone(
             """SELECT COUNT(*) AS count, COALESCE(MAX(id), 0) AS max_id
-               FROM screen_event WHERE embedding IS NOT NULL"""
+               FROM screen_event WHERE embedding IS NOT NULL AND embedding_dim=?""",
+            (dimension,),
         )
         count = int(signature_row["count"])
         max_id = int(signature_row["max_id"])
@@ -217,6 +218,13 @@ class SearchEngine:
             )
             self._cache_signature = (dimension, count, max_id)
             return self._cache_rows, self._cache_matrix
+
+    def invalidate_embedding_cache(self) -> None:
+        """Discard cached vectors after an existing event is re-indexed in place."""
+        with self._cache_lock:
+            self._cache_signature = None
+            self._cache_rows = []
+            self._cache_matrix = None
 
     @staticmethod
     def _vectorize(raw_rows: list[Any], dimension: int) -> tuple[list[Any], list[np.ndarray]]:

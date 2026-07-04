@@ -122,7 +122,7 @@ class Database:
         return connection
 
     def initialize(self) -> None:
-        with self.connect() as connection:
+        with closing(self.connect()) as connection, connection:
             connection.executescript(SCHEMA)
             pack_columns = {
                 str(row["name"])

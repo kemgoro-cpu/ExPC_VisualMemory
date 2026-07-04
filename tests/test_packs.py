@@ -118,6 +118,25 @@ def test_reapproving_approved_pack_with_expiry_hours_extends_expiration(service)
     assert new_expires_at > original_expires_at
 
 
+def test_reapproval_starts_explicit_expiry_from_now(service):
+    event_id = add_event(service, "renew me")
+    pack = service.packs.create("Renew", [event_id])
+    old_approved = datetime.now(UTC) - timedelta(days=30)
+    service.db.execute(
+        "UPDATE context_pack SET approved_at=?, expires_at=? WHERE id=?",
+        (old_approved.isoformat(), (datetime.now(UTC) + timedelta(days=1)).isoformat(), pack["id"]),
+    )
+
+    before = datetime.now(UTC)
+    renewed = service.packs.approve(pack["id"], expiry_hours=2)
+    after = datetime.now(UTC)
+    approved_at = datetime.fromisoformat(renewed["approved_at"])
+    expires_at = datetime.fromisoformat(renewed["expires_at"])
+
+    assert before <= approved_at <= after
+    assert expires_at - approved_at == timedelta(hours=2)
+
+
 def test_export_is_one_self_contained_html_file(service):
     event_id = add_event(service, "export me")
     pack = service.packs.create("Export", [event_id])

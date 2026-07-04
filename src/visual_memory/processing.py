@@ -13,7 +13,7 @@ import numpy as np
 from .ai import EmbeddingProvider, OcrProvider
 from .capture import FrameCandidate, iso
 from .db import Database
-from .imaging import perceptual_hash
+from .imaging import perceptual_hash, to_bgr
 from .storage import Storage
 
 LOGGER = logging.getLogger(__name__)
@@ -96,6 +96,7 @@ class EventProcessor:
         self.status = ProcessorStatus()
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+        self._index_lock = threading.Lock()
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -156,44 +157,68 @@ class EventProcessor:
             (event_id, str(stored.frame_path), stored.sha256, iso(datetime.now(UTC))),
         )
         try:
-            ocr_result = self.ocr.recognize(item.candidate.frame)
-            vector = self.embeddings.encode_document(ocr_result.text) if ocr_result.text else None
-            metadata = json.dumps(
-                {
-                    "provider": self.ocr.name,
-                    "lines": [
-                        {"text": line.text, "confidence": line.confidence, "polygon": line.polygon}
-                        for line in ocr_result.lines
-                    ],
-                },
-                ensure_ascii=False,
-            )
-            with self.db.transaction() as connection:
-                connection.execute(
-                    """
-                    UPDATE screen_event SET
-                        ocr_text=?, ocr_confidence=?, embedding=?, embedding_dim=?, processed_at=?
-                    WHERE id=?
-                    """,
-                    (
-                        ocr_result.text,
-                        ocr_result.confidence,
-                        vector.astype(np.float32).tobytes() if vector is not None else None,
-                        int(vector.size) if vector is not None else None,
-                        iso(datetime.now(UTC)),
-                        event_id,
-                    ),
-                )
-                connection.execute(
-                    """INSERT INTO evidence(event_id, kind, text, mime_type, metadata_json, created_at)
-                       VALUES(?, 'ocr', ?, 'text/plain', ?, ?)""",
-                    (event_id, ocr_result.text, metadata, iso(datetime.now(UTC))),
-                )
+            self._index_event(event_id, item.candidate.frame)
         except Exception as exc:
             LOGGER.exception("Indexing failed for event %s", event_id)
             self.status.last_error = str(exc)
             self.status.failures += 1
         return event_id
+
+    def reprocess_one(self, event_id: int) -> int:
+        """Retry OCR and embedding generation for an already stored event."""
+        row = self.db.fetchone("SELECT frame_path FROM screen_event WHERE id=?", (event_id,))
+        if not row:
+            raise LookupError("Event not found")
+        try:
+            with self.storage.open_image(row["frame_path"]) as image:
+                frame = to_bgr(image)
+            self._index_event(event_id, frame)
+        except Exception as exc:
+            LOGGER.exception("Reindexing failed for event %s", event_id)
+            self.status.last_error = str(exc)
+            self.status.failures += 1
+            raise
+        self.status.processed += 1
+        self.status.last_processed_at = iso(datetime.now(UTC))
+        return event_id
+
+    def _index_event(self, event_id: int, frame: np.ndarray) -> None:
+        # OCRバックエンドは同時呼び出しを保証しないため、録画処理と手動再処理を直列化する。
+        with self._index_lock:
+            ocr_result = self.ocr.recognize(frame)
+            vector = self.embeddings.encode_document(ocr_result.text) if ocr_result.text else None
+        metadata = json.dumps(
+            {
+                "provider": self.ocr.name,
+                "lines": [
+                    {"text": line.text, "confidence": line.confidence, "polygon": line.polygon}
+                    for line in ocr_result.lines
+                ],
+            },
+            ensure_ascii=False,
+        )
+        processed_at = iso(datetime.now(UTC))
+        with self.db.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE screen_event SET
+                    ocr_text=?, ocr_confidence=?, embedding=?, embedding_dim=?, processed_at=?
+                WHERE id=?
+                """,
+                (
+                    ocr_result.text,
+                    ocr_result.confidence,
+                    vector.astype(np.float32).tobytes() if vector is not None else None,
+                    int(vector.size) if vector is not None else None,
+                    processed_at,
+                    event_id,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO evidence(event_id, kind, text, mime_type, metadata_json, created_at)
+                   VALUES(?, 'ocr', ?, 'text/plain', ?, ?)""",
+                (event_id, ocr_result.text, metadata, processed_at),
+            )
 
     def _run(self) -> None:
         while not self._stop.is_set() or len(self.queue):

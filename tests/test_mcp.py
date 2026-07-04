@@ -11,6 +11,8 @@ def test_mcp_lists_new_context_documents_without_manual_approval(monkeypatch, se
     event_id = add_event(service, "approved MCP evidence")
     document_pack = service.packs.create("ready context", [event_id])
     listed = json.loads(mcp_server.list_context_packs())
+    assert "artifact_path" not in listed[0]
+    assert "manifest_sha256" not in listed[0]
     assert [pack["id"] for pack in listed] == [document_pack["id"]]
     manifest = json.loads(mcp_server.get_context_pack(document_pack["id"]))
     assert manifest["items"][0]["event_id"] == event_id

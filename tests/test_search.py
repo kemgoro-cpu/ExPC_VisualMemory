@@ -1,4 +1,5 @@
 from conftest import add_event
+
 from visual_memory.api import _normalize_time
 
 
@@ -50,6 +51,37 @@ def test_mixed_query_short_token_is_not_dropped_from_exact_search(service):
 
     assert short_only_id in ids
     assert long_only_id in ids
+
+
+def test_embedding_cache_appends_only_matching_dimension_rows(monkeypatch, service):
+    add_event(service, "first vector", seconds=1)
+    service.search.search("first vector")
+    service.db.execute(
+        """INSERT INTO screen_event(
+               session_id,started_at,ended_at,frame_path,thumbnail_path,phash,change_score,
+               width,height,event_kind,ocr_text,embedding,embedding_dim,created_at
+           ) SELECT session_id,started_at,ended_at,frame_path,thumbnail_path,phash,change_score,
+                    width,height,event_kind,'other model',?,7,created_at
+             FROM screen_event WHERE id=1""",
+        (b"\0" * 28,),
+    )
+    add_event(service, "second vector", seconds=2)
+
+    queries: list[str] = []
+    original_fetchall = service.db.fetchall
+
+    def recording_fetchall(sql, params=()):
+        queries.append(" ".join(sql.split()))
+        return original_fetchall(sql, params)
+
+    monkeypatch.setattr(service.db, "fetchall", recording_fetchall)
+    service.search.search("second vector")
+
+    assert any("id > ?" in query for query in queries)
+    assert not any(
+        query == "SELECT * FROM screen_event WHERE embedding IS NOT NULL AND embedding_dim=? ORDER BY id"
+        for query in queries
+    )
 
 
 def test_initialize_migrates_unicode61_fts_and_rebuilds_existing_rows(service):

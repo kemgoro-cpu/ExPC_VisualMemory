@@ -1,4 +1,4 @@
-# External PC Visual Memory 0.2.0 — 初回起動
+# External PC Visual Memory 0.2.1 — 初回起動
 
 ## 1. 起動
 

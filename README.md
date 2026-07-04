@@ -2,6 +2,13 @@
 
 キャプチャーボードから取得した別PCの画面を、ローカルで検索可能な履歴へ変換します。生の画面履歴はAIへ公開されません。検索UIで選んで作成したコンテキスト文書だけをMCPから取得できます。文書は作成時点で利用可能になり、作成後の墨消しにも追従して再生成されます。
 
+## 0.2.1の主な変更
+
+- FFmpegの警告出力による停止を防ぎ、検索の短語・時刻境界・埋め込みキャッシュを修正
+- 承認期限、認証トークン、履歴削除、設定破損時の復旧を堅牢化
+- 保存済みイベントのOCR・検索再処理と、失敗した文書の再生成操作を追加
+- イベントカードのキーボード選択と、非表示タブでの状態ポーリング停止に対応
+
 ## 0.2.0の主な変更
 
 - ローカルUIを先に起動し、OCR・意味検索モデルをバックグラウンドで準備
@@ -102,7 +109,7 @@ python scripts/prefetch_models.py --output-dir work\model-bundle
 powershell -ExecutionPolicy Bypass -File scripts\build_release.ps1 -Profile Both
 ```
 
-出力名は`outputs\external-pc-visual-memory-lite-0.2.0`と`outputs\external-pc-visual-memory-full-0.2.0`です。各配布物にSHA-256、初回起動ガイド、MCP設定例を同梱します。
+出力名は`outputs\external-pc-visual-memory-lite-0.2.1`と`outputs\external-pc-visual-memory-full-0.2.1`です。各配布物にSHA-256、初回起動ガイド、MCP設定例を同梱します。
 
 ## GPU OCR（非商用プロファイル）
 

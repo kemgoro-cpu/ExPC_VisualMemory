@@ -150,7 +150,7 @@ function renderEvents() {
         <button class="ghost session-select" data-select-session="${sessionId}">${selectLabel}</button>
       </header>
       ${collapsed ? "" : `<div class="session-event-grid" data-lasso-session="${sessionId}">
-        ${events.map(event => `<article class="event-card ${state.selected.has(event.id) ? "selected" : ""}" data-event-id="${event.id}">
+        ${events.map(event => `<article class="event-card ${state.selected.has(event.id) ? "selected" : ""}" data-event-id="${event.id}" tabindex="0" role="checkbox" aria-checked="${state.selected.has(event.id)}" aria-label="${formatTime(event.started_at)}の場面を選択">
           <div class="event-image"><img draggable="false" loading="lazy" src="/api/events/${event.id}/frame?thumbnail=true" alt=""><span class="selection-mark">✓</span><span class="event-score">${event.event_kind}${event.score ? ` · ${(event.score * 1000).toFixed(1)}` : ""}</span></div>
           <div class="event-body"><div class="event-time">${formatTime(event.started_at)}</div><div class="event-text">${escapeHtml(event.ocr_excerpt || "OCR待ち、または文字なし")}</div>
           <div class="event-actions"><label class="check-label"><input type="checkbox" data-select="${event.id}" ${state.selected.has(event.id) ? "checked" : ""}>選択</label><button class="ghost" data-detail="${event.id}">詳細</button></div></div>
@@ -160,6 +160,12 @@ function renderEvents() {
   }).join("") || `<p class="muted">該当する画面履歴がありません。</p>`;
   document.querySelectorAll("[data-select]").forEach(input => input.addEventListener("change", event => toggleSelected(Number(input.dataset.select), input.checked, event.shiftKey)));
   document.querySelectorAll("[data-detail]").forEach(button => button.addEventListener("click", () => showDetail(Number(button.dataset.detail))));
+  document.querySelectorAll(".event-card[data-event-id]").forEach(card => card.addEventListener("keydown", event => {
+    if (event.target !== card || !["Enter", " "].includes(event.key)) return;
+    event.preventDefault();
+    const id = Number(card.dataset.eventId);
+    toggleSelected(id, !state.selected.has(id), event.shiftKey);
+  }));
   document.querySelectorAll("[data-select-session]").forEach(button => button.addEventListener("click", () => toggleSessionSelection(button.dataset.selectSession)));
   document.querySelectorAll("[data-toggle-session]").forEach(button => button.addEventListener("click", () => {
     const sessionId = button.dataset.toggleSession;
@@ -204,6 +210,7 @@ function syncSelectionCards() {
   document.querySelectorAll(".event-card[data-event-id]").forEach(card => {
     const selected = state.selected.has(Number(card.dataset.eventId));
     card.classList.toggle("selected", selected);
+    card.setAttribute("aria-checked", String(selected));
     const input = card.querySelector("[data-select]"); if (input) input.checked = selected;
   });
 }
@@ -290,8 +297,16 @@ function reorderBasket(sourceId, targetId) {
 async function showDetail(id) {
   try {
     const data = await api(`/api/events/${id}`); const event = data.event;
-    $("detailContent").innerHTML = `<p class="eyebrow">EVENT ${event.id}</p><h2>${formatTime(event.started_at)}</h2><img class="detail-image" src="/api/events/${event.id}/frame"><pre class="ocr-box">${escapeHtml(event.ocr_text || "OCRテキストなし")}</pre>`;
-    $("detailDialog").showModal();
+    $("detailContent").innerHTML = `<p class="eyebrow">EVENT ${event.id}</p><h2>${formatTime(event.started_at)}</h2><img class="detail-image" src="/api/events/${event.id}/frame"><pre class="ocr-box">${escapeHtml(event.ocr_text || "OCRテキストなし")}</pre><div class="dialog-actions"><button class="ghost" data-reindex-event="${event.id}">OCR・検索を再処理</button></div>`;
+    document.querySelector("[data-reindex-event]").addEventListener("click", async buttonEvent => {
+      const button = buttonEvent.currentTarget; button.disabled = true; button.textContent = "再処理中…";
+      try {
+        await api(`/api/events/${event.id}/reindex`, {method:"POST"});
+        toast("OCR・検索インデックスを再処理しました。");
+        await showDetail(event.id); await searchEvents();
+      } catch (error) { toast(error.message, true); button.disabled = false; button.textContent = "OCR・検索を再処理"; }
+    });
+    if (!$("detailDialog").open) $("detailDialog").showModal();
   } catch (error) { toast(error.message, true); }
 }
 
@@ -319,12 +334,17 @@ async function showPacks() {
 async function openPack(id) {
   try {
     const pack = await api(`/api/packs/${id}`); state.activePack = pack;
-    const exportActions = pack.status === "draft" ? `<p class="muted">この文書は未公開です。${pack.build_error ? `生成エラー: ${escapeHtml(pack.build_error)}` : "再生成が完了していません。"}</p>` : `<a href="/api/packs/${id}/document?format=pdf"><button class="primary">PDF文書</button></a><a href="/api/packs/${id}/document?format=html"><button class="ghost">単一HTML</button></a>`;
+    const exportActions = pack.status === "draft" ? `<div><p class="muted">この文書は未公開です。${pack.build_error ? `生成エラー: ${escapeHtml(pack.build_error)} 再生成すると復旧できます。` : "再生成が完了していません。"}</p><button class="primary" data-rebuild-pack="${id}">文書を再生成</button></div>` : `<a href="/api/packs/${id}/document?format=pdf"><button class="primary">PDF文書</button></a><a href="/api/packs/${id}/document?format=html"><button class="ghost">単一HTML</button></a>`;
     const actions = `${exportActions}${pack.status === "approved" ? `<button class="danger" data-revoke="${id}">MCP共有を停止</button>` : ""}`;
     $("packList").innerHTML = `<button class="ghost" id="backToPacks">← 一覧</button><article class="pack-card"><span class="pack-status">${packStatusLabel(pack.status)}</span><h3>${escapeHtml(pack.title)}</h3><p class="muted">${escapeHtml(pack.note)}</p><div class="pack-items">${pack.items.map((item, index) => `<div class="pack-item"><span class="pack-item-position">${index + 1}</span><img src="/api/events/${item.event_id}/frame">${pack.status === "approved" ? `<button data-redact="${item.event_id}">墨消し</button>` : ""}</div>`).join("")}</div><div class="dialog-actions">${actions}</div></article>`;
     $("backToPacks").onclick = showPacks;
     document.querySelectorAll("[data-redact]").forEach(button => button.addEventListener("click", () => beginRedaction(pack, Number(button.dataset.redact))));
     document.querySelector("[data-revoke]")?.addEventListener("click", async () => { try { await api(`/api/packs/${id}/revoke`, {method:"POST"}); toast("MCP共有を停止しました。"); openPack(id); } catch(error) { toast(error.message,true); } });
+    document.querySelector("[data-rebuild-pack]")?.addEventListener("click", async event => {
+      const button = event.currentTarget; button.disabled = true; button.textContent = "再生成中…";
+      try { await api(`/api/packs/${id}/approve`, {method:"POST"}); toast("文書を再生成しました。"); openPack(id); }
+      catch(error) { toast(error.message,true); button.disabled = false; button.textContent = "文書を再生成"; }
+    });
   } catch (error) { toast(error.message, true); }
 }
 
@@ -410,9 +430,10 @@ document.addEventListener("DOMContentLoaded", () => {
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
       clearInterval(statusInterval);
+      statusInterval = null;
     } else {
       refreshStatus();
-      statusInterval = setInterval(refreshStatus, 5000);
+      if (statusInterval === null) statusInterval = setInterval(refreshStatus, 5000);
     }
   });
 });

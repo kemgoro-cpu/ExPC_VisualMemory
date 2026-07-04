@@ -153,7 +153,9 @@ class Settings:
         if config_path.exists():
             try:
                 current = json.loads(config_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError) as exc:
+                if not isinstance(current, dict):
+                    raise ValueError("config root must be a JSON object")
+            except (json.JSONDecodeError, OSError, ValueError) as exc:
                 # 破損したconfig.jsonは無視し、デフォルトから作り直す
                 LOGGER.warning("config.json is corrupted; recreating with defaults: %s", exc)
                 current = {}
@@ -173,7 +175,9 @@ def load_settings(data_dir: str | Path | None = None) -> Settings:
     if config_path.exists():
         try:
             raw = json.loads(config_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as exc:
+            if not isinstance(raw, dict):
+                raise ValueError("config root must be a JSON object")
+        except (json.JSONDecodeError, OSError, ValueError) as exc:
             # 破損したconfig.jsonで起動不能にせず、デフォルト設定にフォールバックする
             LOGGER.warning("config.json is corrupted; falling back to defaults: %s", exc)
             raw = {}
