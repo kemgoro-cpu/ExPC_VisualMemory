@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -184,20 +184,20 @@ class Database:
             connection.close()
 
     def execute(self, sql: str, params: Sequence[Any] = ()) -> int:
-        with self.connect() as connection:
+        # `with connection:` はトランザクションのcommit/rollbackのみでクローズはしないため、
+        # closing()で明示的にコネクションを閉じる
+        with closing(self.connect()) as connection, connection:
             cursor = connection.execute(sql, params)
-            connection.commit()
             return int(cursor.lastrowid or 0)
 
     def executemany(self, sql: str, params: Sequence[Sequence[Any]]) -> None:
-        with self.connect() as connection:
+        with closing(self.connect()) as connection, connection:
             connection.executemany(sql, params)
-            connection.commit()
 
     def fetchone(self, sql: str, params: Sequence[Any] = ()) -> sqlite3.Row | None:
-        with self.connect() as connection:
+        with closing(self.connect()) as connection:
             return connection.execute(sql, params).fetchone()
 
     def fetchall(self, sql: str, params: Sequence[Any] = ()) -> list[sqlite3.Row]:
-        with self.connect() as connection:
+        with closing(self.connect()) as connection:
             return list(connection.execute(sql, params).fetchall())

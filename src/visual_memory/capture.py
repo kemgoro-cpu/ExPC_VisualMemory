@@ -185,12 +185,21 @@ def list_directshow_devices(ffmpeg_path: str = "ffmpeg") -> list[str]:
     return parse_directshow_devices(result.stderr)
 
 
+STDERR_TAIL_BYTES = 4096
+
+
 class FFmpegFrameSource:
     def __init__(self, settings: Settings, source_name: str, source_file: str | Path | None = None):
         self.settings = settings
         self.source_name = source_name
         self.source_file = Path(source_file) if source_file else None
         self.process: subprocess.Popen[bytes] | None = None
+        # stderrを別スレッドで読み続けないと、FFmpegが警告を大量出力した際に
+        # OSのパイプバッファが満杯になりFFmpeg側がブロックしてハングするため、
+        # 末尾だけをリングバッファ的に保持してエラーメッセージ用に使う
+        self._stderr_tail = bytearray()
+        self._stderr_lock = threading.Lock()
+        self._stderr_thread: threading.Thread | None = None
 
     def command(self) -> list[str]:
         base = [self.settings.ffmpeg_path, "-hide_banner", "-loglevel", "warning"]
@@ -230,6 +239,11 @@ class FFmpegFrameSource:
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         assert self.process.stdout is not None
+        assert self.process.stderr is not None
+        self._stderr_thread = threading.Thread(
+            target=self._drain_stderr, args=(self.process.stderr,), daemon=True, name="ffmpeg-stderr"
+        )
+        self._stderr_thread.start()
         while not stop_event.is_set():
             data = self._read_exact(self.process.stdout, frame_size)
             if len(data) != frame_size:
@@ -239,10 +253,20 @@ class FFmpegFrameSource:
             )
         return_code = self.process.poll()
         if not stop_event.is_set() and return_code not in (None, 0):
-            error = b""
-            if self.process.stderr:
-                error = self.process.stderr.read(4096)
+            with self._stderr_lock:
+                error = bytes(self._stderr_tail)
             raise RuntimeError(error.decode("utf-8", errors="replace") or f"FFmpeg exited {return_code}")
+
+    def _drain_stderr(self, stream) -> None:
+        # 常時読み切ることでOSパイプバッファの詰まりを防ぐ。内容は末尾のみ保持する
+        while True:
+            chunk = stream.read(4096)
+            if not chunk:
+                break
+            with self._stderr_lock:
+                self._stderr_tail.extend(chunk)
+                if len(self._stderr_tail) > STDERR_TAIL_BYTES:
+                    del self._stderr_tail[: len(self._stderr_tail) - STDERR_TAIL_BYTES]
 
     @staticmethod
     def _read_exact(stream, size: int) -> bytes:

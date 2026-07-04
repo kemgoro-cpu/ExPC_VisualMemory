@@ -32,11 +32,30 @@ def _service() -> ContextPackService:
     return ContextPackService(database, settings)
 
 
+# artifact_path やmanifest_sha256などのローカルファイルシステム内部情報はAIに公開しない
+_PUBLIC_PACK_FIELDS = {
+    "id",
+    "title",
+    "note",
+    "query",
+    "status",
+    "item_count",
+    "deduplicate_overlaps",
+    "created_at",
+    "approved_at",
+    "expires_at",
+}
+
+
+def _public_pack(pack: dict) -> dict:
+    return {key: value for key, value in pack.items() if key in _PUBLIC_PACK_FIELDS}
+
+
 @mcp.tool()
 def list_context_packs(search: str = "") -> str:
     """List user-created context documents that are currently available."""
     packs = _service().list(include_drafts=False, search=search)
-    return json.dumps(packs, ensure_ascii=False, indent=2)
+    return json.dumps([_public_pack(pack) for pack in packs], ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
@@ -45,7 +64,7 @@ def search_context_packs(query: str) -> str:
     if not query.strip():
         raise ValueError("query must not be empty")
     packs = _service().list(include_drafts=False, search=query.strip())
-    return json.dumps(packs, ensure_ascii=False, indent=2)
+    return json.dumps([_public_pack(pack) for pack in packs], ensure_ascii=False, indent=2)
 
 
 @mcp.tool()

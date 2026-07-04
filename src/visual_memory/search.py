@@ -40,7 +40,8 @@ class SearchEngine:
         self.db = db
         self.embeddings = embeddings
         self._cache_lock = threading.Lock()
-        self._cache_signature: tuple[int, int] | None = None
+        # signature = (dimension, count, max_id)
+        self._cache_signature: tuple[int, int, int] | None = None
         self._cache_rows: list[Any] = []
         self._cache_matrix: np.ndarray | None = None
 
@@ -98,7 +99,7 @@ class SearchEngine:
             conditions.append("e.started_at <= ?")
             params.append(end)
         params.append(limit)
-        return self.db.fetchall(
+        fts_rows = self.db.fetchall(
             f"""
             SELECT e.*, bm25(screen_event_fts) AS bm25_score
             FROM screen_event_fts JOIN screen_event e ON e.id=screen_event_fts.rowid
@@ -107,6 +108,20 @@ class SearchEngine:
             """,
             params,
         )
+        # トライグラムFTSは3文字未満のトークンを拾えないため、
+        # そのようなトークンが混在するクエリではLIKE検索の結果もマージする
+        short_tokens = [token for token in TOKEN_RE.findall(query) if len(token) < 3]
+        if not short_tokens:
+            return fts_rows
+        merged = list(fts_rows)
+        seen_ids = {int(row["id"]) for row in fts_rows}
+        for token in short_tokens:
+            for row in self._like_exact(token, start, end, limit):
+                row_id = int(row["id"])
+                if row_id not in seen_ids:
+                    seen_ids.add(row_id)
+                    merged.append(row)
+        return merged[:limit]
 
     def _like_exact(self, query: str, start: str | None, end: str | None, limit: int):
         value = query.strip()
@@ -158,31 +173,65 @@ class SearchEngine:
             """SELECT COUNT(*) AS count, COALESCE(MAX(id), 0) AS max_id
                FROM screen_event WHERE embedding IS NOT NULL"""
         )
-        signature = (int(signature_row["count"]), int(signature_row["max_id"]))
+        count = int(signature_row["count"])
+        max_id = int(signature_row["max_id"])
         with self._cache_lock:
-            if signature == self._cache_signature:
+            if self._cache_signature == (dimension, count, max_id):
                 return self._cache_rows, self._cache_matrix
+
+            cached_dimension, cached_count, cached_max_id = self._cache_signature or (None, 0, 0)
+            can_append = cached_dimension == dimension and cached_max_id <= max_id
+            if can_append:
+                # 前回のmax_id以降に増えた行だけを追加ロードする(録画中の全再構築を避ける)
+                new_rows = self.db.fetchall(
+                    """SELECT * FROM screen_event
+                       WHERE embedding IS NOT NULL AND embedding_dim=? AND id > ?
+                       ORDER BY id""",
+                    (dimension, cached_max_id),
+                )
+                appended_rows, appended_vectors = self._vectorize(new_rows, dimension)
+                if cached_count + len(appended_rows) == count:
+                    rows = self._cache_rows + appended_rows
+                    if appended_vectors:
+                        matrix = (
+                            np.vstack([self._cache_matrix, *appended_vectors])
+                            if self._cache_matrix is not None
+                            else np.ascontiguousarray(np.vstack(appended_vectors), dtype=np.float32)
+                        )
+                    else:
+                        matrix = self._cache_matrix
+                    self._cache_rows = rows
+                    self._cache_matrix = matrix
+                    self._cache_signature = (dimension, count, max_id)
+                    return self._cache_rows, self._cache_matrix
+                # 途中の行が削除されるなどappendだけで説明できない差分があれば全再構築にフォールバック
+
             raw_rows = self.db.fetchall(
                 "SELECT * FROM screen_event WHERE embedding IS NOT NULL AND embedding_dim=? ORDER BY id",
                 (dimension,),
             )
-            rows: list[Any] = []
-            vectors: list[np.ndarray] = []
-            for row in raw_rows:
-                vector = np.frombuffer(row["embedding"], dtype=np.float32)
-                if vector.size != dimension:
-                    continue
-                norm = float(np.linalg.norm(vector))
-                if not norm:
-                    continue
-                rows.append(row)
-                vectors.append(vector / norm)
+            rows, vectors = self._vectorize(raw_rows, dimension)
             self._cache_rows = rows
             self._cache_matrix = (
                 np.ascontiguousarray(np.vstack(vectors), dtype=np.float32) if vectors else None
             )
-            self._cache_signature = signature
+            self._cache_signature = (dimension, count, max_id)
             return self._cache_rows, self._cache_matrix
+
+    @staticmethod
+    def _vectorize(raw_rows: list[Any], dimension: int) -> tuple[list[Any], list[np.ndarray]]:
+        rows: list[Any] = []
+        vectors: list[np.ndarray] = []
+        for row in raw_rows:
+            vector = np.frombuffer(row["embedding"], dtype=np.float32)
+            if vector.size != dimension:
+                continue
+            norm = float(np.linalg.norm(vector))
+            if not norm:
+                continue
+            rows.append(row)
+            vectors.append(vector / norm)
+        return rows, vectors
 
     @staticmethod
     def _time_clause(start: str | None, end: str | None, prefix: str = "WHERE") -> tuple[str, list[str]]:

@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "visual-memory",
+      "runtimeExecutable": ".venv/Scripts/visual-memory.exe",
+      "runtimeArgs": [],
+      "port": 8765
+    }
+  ]
+}

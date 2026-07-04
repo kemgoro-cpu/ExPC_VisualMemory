@@ -107,6 +107,17 @@ def test_expired_and_revoked_packs_are_not_listed_for_mcp(service):
         service.packs.get_approved(pack["id"])
 
 
+def test_reapproving_approved_pack_with_expiry_hours_extends_expiration(service):
+    event_id = add_event(service, "extend me")
+    pack = service.packs.create("Extend", [event_id])
+    original_expires_at = datetime.fromisoformat(pack["expires_at"])
+
+    extended = service.packs.approve(pack["id"], expiry_hours=999)
+    new_expires_at = datetime.fromisoformat(extended["expires_at"])
+
+    assert new_expires_at > original_expires_at
+
+
 def test_export_is_one_self_contained_html_file(service):
     event_id = add_event(service, "export me")
     pack = service.packs.create("Export", [event_id])

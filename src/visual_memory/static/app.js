@@ -404,5 +404,15 @@ document.addEventListener("DOMContentLoaded", () => {
   $("clearIgnoreRegions").onclick = () => { if(state.regionEditor){state.regionEditor.ignore=[];drawRegions();} };
   $("clearWatchRegions").onclick = () => { if(state.regionEditor){state.regionEditor.watch=[];drawRegions();} };
   $("saveRegions").onclick = async () => { try { const editor=state.regionEditor;await api("/api/capture/regions",{method:"PUT",body:{ignore_regions:editor.ignore,watch_regions:editor.watch}});$("regionDialog").close();toast("差分検出領域を保存しました。"); } catch(error){toast(error.message,true);} };
-  renderBasket(); loadDevices(); searchEvents(); refreshStatus(); setInterval(refreshStatus, 5000);
+  renderBasket(); loadDevices(); searchEvents(); refreshStatus();
+  // タブが非表示の間はポーリングを止め、無駄なリクエストを避ける
+  let statusInterval = setInterval(refreshStatus, 5000);
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      clearInterval(statusInterval);
+    } else {
+      refreshStatus();
+      statusInterval = setInterval(refreshStatus, 5000);
+    }
+  });
 });

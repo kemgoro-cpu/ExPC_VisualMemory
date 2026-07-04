@@ -1,8 +1,10 @@
+import sys
+import threading
 from datetime import UTC, datetime, timedelta
 
 import numpy as np
 
-from visual_memory.capture import CaptureManager, ChangeDetector, parse_directshow_devices
+from visual_memory.capture import CaptureManager, ChangeDetector, FFmpegFrameSource, parse_directshow_devices
 from visual_memory.config import Settings
 from visual_memory.imaging import Region
 
@@ -85,6 +87,35 @@ def test_watch_region_detects_small_but_important_cell_change():
     assert detector.push(after, 1.0, base + timedelta(seconds=1)) == []
     stable = detector.push(after, 2.6, base + timedelta(seconds=2.6))
     assert [item.event_kind for item in stable] == ["stable"]
+
+
+def test_ffmpeg_stderr_drain_prevents_pipe_deadlock(tmp_path):
+    # stdoutを書く前に大量のstderrを出力する疑似FFmpegプロセス。
+    # stderrを読み捨てずに放置するとOSのパイプバッファが満杯になり
+    # 子プロセスがブロックし、stdout待ちの親側も一緒にハングしてしまう
+    settings = Settings(data_dir=tmp_path / "data", capture_width=2, capture_height=2)
+    source = FFmpegFrameSource(settings, "dummy")
+    frame_bytes = settings.capture_width * settings.capture_height * 3
+    script = (
+        "import sys\n"
+        "sys.stderr.write('W' * 200000)\n"
+        "sys.stderr.flush()\n"
+        f"sys.stdout.buffer.write(bytes([1]) * {frame_bytes})\n"
+        "sys.stdout.flush()\n"
+    )
+    source.command = lambda: [sys.executable, "-c", script]
+    stop_event = threading.Event()
+    result: list[np.ndarray] = []
+
+    def consume():
+        result.extend(source.frames(stop_event))
+
+    thread = threading.Thread(target=consume, daemon=True)
+    thread.start()
+    thread.join(timeout=10)
+    assert not thread.is_alive(), "stderrが未読のままだとFFmpegがブロックしハングする"
+    assert len(result) == 1
+    source.close()
 
 
 def test_capture_reconnect_clears_transient_session_error(tmp_path):

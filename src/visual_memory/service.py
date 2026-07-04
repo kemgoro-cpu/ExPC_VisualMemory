@@ -213,13 +213,16 @@ def bitlocker_status(path: Path) -> dict[str, str]:
     if os.name != "nt":
         return {"status": "not-applicable", "detail": "BitLocker check is Windows-only"}
     drive = path.resolve().drive
+    # driveを文字列展開せず、-Command以降の引数を$argsとして渡すことで
+    # コマンド文字列組み立てによる注入リスクを避ける
     command = [
         "powershell",
         "-NoProfile",
         "-NonInteractive",
         "-Command",
-        f"Get-BitLockerVolume -MountPoint '{drive}' | "
+        "Get-BitLockerVolume -MountPoint $args[0] | "
         "Select-Object ProtectionStatus,VolumeStatus | ConvertTo-Json -Compress",
+        drive,
     ]
     try:
         result = subprocess.run(command, capture_output=True, text=True, timeout=8, check=False)

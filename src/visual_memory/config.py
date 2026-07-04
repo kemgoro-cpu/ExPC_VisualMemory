@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import secrets
 import shutil
@@ -9,6 +10,8 @@ from contextlib import suppress
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
+
+LOGGER = logging.getLogger(__name__)
 
 APP_NAME = "ExternalPCVisualMemory"
 
@@ -148,7 +151,12 @@ class Settings:
         config_path = self.data_dir / "config.json"
         current: dict[str, Any] = {}
         if config_path.exists():
-            current = json.loads(config_path.read_text(encoding="utf-8"))
+            try:
+                current = json.loads(config_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError) as exc:
+                # 破損したconfig.jsonは無視し、デフォルトから作り直す
+                LOGGER.warning("config.json is corrupted; recreating with defaults: %s", exc)
+                current = {}
         current["ignore_regions"] = ignore_regions
         current["watch_regions"] = watch_regions
         temporary = config_path.with_suffix(".json.tmp")
@@ -163,7 +171,12 @@ def load_settings(data_dir: str | Path | None = None) -> Settings:
     values: dict[str, Any] = {"data_dir": root}
     config_path = root / "config.json"
     if config_path.exists():
-        raw = json.loads(config_path.read_text(encoding="utf-8"))
+        try:
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            # 破損したconfig.jsonで起動不能にせず、デフォルト設定にフォールバックする
+            LOGGER.warning("config.json is corrupted; falling back to defaults: %s", exc)
+            raw = {}
         allowed = {field.name for field in fields(Settings)} - {"data_dir"}
         values.update({key: value for key, value in raw.items() if key in allowed})
     env_map = {

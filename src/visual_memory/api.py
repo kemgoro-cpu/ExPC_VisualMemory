@@ -4,6 +4,7 @@ import hashlib
 import secrets
 from contextlib import asynccontextmanager
 from dataclasses import asdict
+from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -33,6 +34,22 @@ def _static_version() -> str:
 STATIC_VERSION = _static_version()
 
 
+def _normalize_time(value: str | None) -> str | None:
+    """フロントの'Z'サフィックスとDB保存形式('+00:00')の食い違いを吸収する。
+
+    DB側の時刻文字列比較と揃うよう、UTCのisoformat('+00:00'サフィックス)に統一する。
+    """
+    if not value:
+        return value
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return value
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC).isoformat()
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
     def __init__(self, app, settings: Settings):
         super().__init__(app)
@@ -42,7 +59,9 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if request.url.path == "/health":
             return await call_next(request)
         token = request.headers.get("X-Visual-Memory-Token") or request.cookies.get("vm_session")
-        query_token = request.query_params.get("token") if request.method == "GET" else None
+        # クエリの?token=はCookie交換用の初回アクセス(/のみ)に限定する。
+        # 他のAPIパスまで許すと、URLを共有した時点で認証トークンごと渡ってしまう
+        query_token = request.query_params.get("token") if request.url.path == "/" else None
         valid_query = query_token and secrets.compare_digest(query_token, self.settings.auth_token)
         if not ((token and secrets.compare_digest(token, self.settings.auth_token)) or valid_query):
             if request.url.path.startswith("/api/"):
@@ -198,6 +217,8 @@ def create_app(settings: Settings | None = None, service: VisualMemoryService | 
         limit: int = Query(default=60, ge=1, le=100),
         offset: int = Query(default=0, ge=0),
     ):
+        start = _normalize_time(start)
+        end = _normalize_time(end)
         results = service.search.search(q, start, end, limit + 1, offset)
         has_more = len(results) > limit
         results = results[:limit]
@@ -244,8 +265,11 @@ def create_app(settings: Settings | None = None, service: VisualMemoryService | 
         return FileResponse(path, media_type="image/webp")
 
     @app.delete("/api/events")
-    def delete_events(start: str | None = None, end: str | None = None):
-        return {"deleted": service.delete_events(start, end)}
+    def delete_events(start: str | None = None, end: str | None = None, confirm: bool = False):
+        # 誤爆防止のため、期間指定とconfirm=trueを必須にする(未指定での全削除を禁止)
+        if not confirm or not start or not end:
+            raise HTTPException(400, "start, end and confirm=true are required")
+        return {"deleted": service.delete_events(_normalize_time(start), _normalize_time(end))}
 
     @app.get("/api/packs")
     def packs():
