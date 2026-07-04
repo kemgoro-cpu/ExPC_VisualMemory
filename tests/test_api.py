@@ -19,6 +19,7 @@ def test_api_requires_auth_and_csrf(settings, service):
         static = client.get("/static/app.js")
         assert static.headers["cache-control"] == "no-store, max-age=0"
         assert client.get("/api/events?q=searchable").status_code == 200
+        assert "security" not in client.get("/api/status").json()
         events_payload = client.get("/api/events?q=searchable").json()
         assert events_payload["sessions"][0]["id"] == "session"
         assert events_payload["sessions"][0]["event_count"] == 1
@@ -43,6 +44,14 @@ def test_api_requires_auth_and_csrf(settings, service):
         )
         assert legacy.status_code == 200
         assert legacy.json()["deduplicate_overlaps"] == 0
+        assert (
+            client.put(
+                f"/api/packs/{allowed.json()['id']}/items/{event_id}/redactions",
+                json={"redactions": []},
+                headers={"X-CSRF-Token": settings.csrf_token},
+            ).status_code
+            == 404
+        )
 
 
 def test_created_pack_is_immediately_available(settings, service):
@@ -197,3 +206,5 @@ def test_ui_exposes_recovery_and_keyboard_controls(settings, service):
     assert "OCR・検索を再処理" in script
     assert "文書を再生成" in script
     assert "statusInterval = null" in script
+    assert "墨消し" not in script
+    assert "BitLocker" not in script

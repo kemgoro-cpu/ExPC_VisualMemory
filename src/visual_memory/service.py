@@ -1,11 +1,7 @@
 from __future__ import annotations
 
-import json
-import os
-import subprocess
 import threading
 from dataclasses import asdict
-from pathlib import Path
 from typing import Any
 
 from .ai import (
@@ -61,9 +57,6 @@ class VisualMemoryService:
         )
         self._maintenance_stop = threading.Event()
         self._maintenance_thread: threading.Thread | None = None
-        self._security_lock = threading.Lock()
-        self._security_status = {"status": "checking", "detail": "BitLocker check is running"}
-        self._security_thread: threading.Thread | None = None
 
     def start(self) -> None:
         self.storage.start_reconciliation()
@@ -71,7 +64,6 @@ class VisualMemoryService:
             start = getattr(provider, "start", None)
             if start:
                 start()
-        self._start_security_check()
         self.processor.start()
         self.packs.expire_due()
         self.retention.cleanup()
@@ -100,22 +92,6 @@ class VisualMemoryService:
             self.packs.expire_due()
             self.retention.cleanup()
             self.storage.reconcile_usage()
-            self._start_security_check()
-
-    def _start_security_check(self) -> None:
-        if self._security_thread and self._security_thread.is_alive():
-            return
-        self._security_thread = threading.Thread(
-            target=self._refresh_security_status,
-            daemon=True,
-            name="bitlocker-status",
-        )
-        self._security_thread.start()
-
-    def _refresh_security_status(self) -> None:
-        result = bitlocker_status(self.settings.data_dir)
-        with self._security_lock:
-            self._security_status = result
 
     def _session_start(self, session_id: str, source_name: str, started_at: str) -> None:
         self.db.execute(
@@ -167,12 +143,7 @@ class VisualMemoryService:
                 "state": self.storage.usage_state,
                 "last_reconciled_at": self.storage.last_reconciled_at,
             },
-            "security": {"bitlocker": self.bitlocker_status()},
         }
-
-    def bitlocker_status(self) -> dict[str, str]:
-        with self._security_lock:
-            return dict(self._security_status)
 
     def capture_readiness(self) -> tuple[bool, str | None]:
         if self.storage.usage_state in {"pending", "scanning"}:
@@ -219,29 +190,3 @@ class VisualMemoryService:
         if not result:
             raise LookupError("Event not found")
         return result
-
-
-def bitlocker_status(path: Path) -> dict[str, str]:
-    if os.name != "nt":
-        return {"status": "not-applicable", "detail": "BitLocker check is Windows-only"}
-    drive = path.resolve().drive
-    # driveを文字列展開せず、-Command以降の引数を$argsとして渡すことで
-    # コマンド文字列組み立てによる注入リスクを避ける
-    command = [
-        "powershell",
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        "Get-BitLockerVolume -MountPoint $args[0] | "
-        "Select-Object ProtectionStatus,VolumeStatus | ConvertTo-Json -Compress",
-        drive,
-    ]
-    try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=8, check=False)
-        if result.returncode != 0 or not result.stdout.strip():
-            return {"status": "unknown", "detail": result.stderr.strip() or "Unable to query BitLocker"}
-        data = json.loads(result.stdout)
-        protected = str(data.get("ProtectionStatus", "")).lower() in {"on", "1"}
-        return {"status": "protected" if protected else "warning", "detail": json.dumps(data)}
-    except Exception as exc:
-        return {"status": "unknown", "detail": str(exc)}

@@ -1,6 +1,6 @@
 const state = {
   events: [], sessions: new Map(), selected: new Map(), query: "", activePack: null,
-  redact: null, regionEditor: null, collapsedSessions: new Set(), knownSessions: new Set(),
+  regionEditor: null, collapsedSessions: new Set(), knownSessions: new Set(),
   lastSelected: null, draggedBasketId: null, dragOverBasketId: null,
   offset: 0, hasMore: false, totalEvents: null, loadingEvents: false, status: null,
 };
@@ -68,8 +68,6 @@ async function refreshStatus() {
     else if (!status.embeddings.available) warnings.push(`意味検索未導入: ${status.embeddings.reason}`);
     if (["pending", "scanning"].includes(status.storage.state)) warnings.push("保存容量を確認中です。");
     if (status.processor.last_error) warnings.push(`索引処理: ${status.processor.last_error}`);
-    if (status.security.bitlocker.status === "checking") warnings.push("BitLockerの状態を確認中です。");
-    else if (status.security.bitlocker.status !== "protected") warnings.push("BitLockerの保護を確認できません。権限とドライブ暗号化を確認してください。");
     if (capture.last_error) warnings.push(`キャプチャー: ${capture.last_error}`);
     $("systemWarnings").innerHTML = warnings.map(value => `<div class="warning">${escapeHtml(value)}</div>`).join("");
     state.status = status; syncCaptureControls();
@@ -336,9 +334,8 @@ async function openPack(id) {
     const pack = await api(`/api/packs/${id}`); state.activePack = pack;
     const exportActions = pack.status === "draft" ? `<div><p class="muted">この文書は未公開です。${pack.build_error ? `生成エラー: ${escapeHtml(pack.build_error)} 再生成すると復旧できます。` : "再生成が完了していません。"}</p><button class="primary" data-rebuild-pack="${id}">文書を再生成</button></div>` : `<a href="/api/packs/${id}/document?format=pdf"><button class="primary">PDF文書</button></a><a href="/api/packs/${id}/document?format=html"><button class="ghost">単一HTML</button></a>`;
     const actions = `${exportActions}${pack.status === "approved" ? `<button class="danger" data-revoke="${id}">MCP共有を停止</button>` : ""}`;
-    $("packList").innerHTML = `<button class="ghost" id="backToPacks">← 一覧</button><article class="pack-card"><span class="pack-status">${packStatusLabel(pack.status)}</span><h3>${escapeHtml(pack.title)}</h3><p class="muted">${escapeHtml(pack.note)}</p><div class="pack-items">${pack.items.map((item, index) => `<div class="pack-item"><span class="pack-item-position">${index + 1}</span><img src="/api/events/${item.event_id}/frame">${pack.status === "approved" ? `<button data-redact="${item.event_id}">墨消し</button>` : ""}</div>`).join("")}</div><div class="dialog-actions">${actions}</div></article>`;
+    $("packList").innerHTML = `<button class="ghost" id="backToPacks">← 一覧</button><article class="pack-card"><span class="pack-status">${packStatusLabel(pack.status)}</span><h3>${escapeHtml(pack.title)}</h3><p class="muted">${escapeHtml(pack.note)}</p><div class="pack-items">${pack.items.map((item, index) => `<div class="pack-item"><span class="pack-item-position">${index + 1}</span><img src="/api/events/${item.event_id}/frame"></div>`).join("")}</div><div class="dialog-actions">${actions}</div></article>`;
     $("backToPacks").onclick = showPacks;
-    document.querySelectorAll("[data-redact]").forEach(button => button.addEventListener("click", () => beginRedaction(pack, Number(button.dataset.redact))));
     document.querySelector("[data-revoke]")?.addEventListener("click", async () => { try { await api(`/api/packs/${id}/revoke`, {method:"POST"}); toast("MCP共有を停止しました。"); openPack(id); } catch(error) { toast(error.message,true); } });
     document.querySelector("[data-rebuild-pack]")?.addEventListener("click", async event => {
       const button = event.currentTarget; button.disabled = true; button.textContent = "再生成中…";
@@ -347,23 +344,6 @@ async function openPack(id) {
     });
   } catch (error) { toast(error.message, true); }
 }
-
-function beginRedaction(pack, eventId) {
-  const item = pack.items.find(value => value.event_id === eventId); const image = new Image();
-  image.onload = () => {
-    const canvas = $("redactionCanvas"); const maxWidth = Math.min(image.width, 1100); const scale = maxWidth / image.width;
-    canvas.width = maxWidth; canvas.height = image.height * scale;
-    state.redact = { packId: pack.id, eventId, image, rectangles: JSON.parse(item.redactions_json || "[]"), drawing: null };
-    drawRedactions(); $("redactionDialog").showModal();
-  };
-  image.src = `/api/events/${eventId}/frame`;
-}
-function drawRedactions() {
-  const { image, rectangles, drawing } = state.redact; const canvas = $("redactionCanvas"); const ctx = canvas.getContext("2d");
-  ctx.drawImage(image, 0, 0, canvas.width, canvas.height); ctx.fillStyle = "rgba(0,0,0,.9)";
-  [...rectangles, ...(drawing ? [drawing] : [])].forEach(rect => ctx.fillRect(rect.x * canvas.width, rect.y * canvas.height, rect.width * canvas.width, rect.height * canvas.height));
-}
-function canvasPoint(event) { const box = $("redactionCanvas").getBoundingClientRect(); return {x:(event.clientX-box.left)/box.width,y:(event.clientY-box.top)/box.height}; }
 
 async function openRegionEditor() {
   try {
@@ -411,12 +391,6 @@ document.addEventListener("DOMContentLoaded", () => {
   $("sortChronological").onclick = () => setSelectionOrder([...state.selected.values()].sort((a,b) => new Date(a.started_at) - new Date(b.started_at)));
   $("reverseOrder").onclick = () => setSelectionOrder([...state.selected.values()].reverse());
   document.querySelectorAll("[data-close]").forEach(button => button.onclick = () => $(button.dataset.close).close());
-  const canvas = $("redactionCanvas");
-  canvas.onpointerdown = event => { if (!state.redact) return; const point = canvasPoint(event); state.redact.drawing = {x:point.x,y:point.y,width:0,height:0}; canvas.setPointerCapture(event.pointerId); };
-  canvas.onpointermove = event => { if (!state.redact?.drawing) return; const point = canvasPoint(event), start = state.redact.drawing; start.width = point.x - start.x; start.height = point.y - start.y; drawRedactions(); };
-  canvas.onpointerup = () => { if (!state.redact?.drawing) return; let {x,y,width,height} = state.redact.drawing; if (width < 0) {x += width; width *= -1;} if (height < 0) {y += height; height *= -1;} if (width > .003 && height > .003) state.redact.rectangles.push({x,y,width,height}); state.redact.drawing = null; drawRedactions(); };
-  $("clearRedactions").onclick = () => { if (state.redact) {state.redact.rectangles=[]; drawRedactions();} };
-  $("saveRedactions").onclick = async () => { try { const r=state.redact; await api(`/api/packs/${r.packId}/items/${r.eventId}/redactions`,{method:"PUT",body:{redactions:r.rectangles}}); $("redactionDialog").close(); toast("墨消しを保存しました。"); openPack(r.packId); } catch(error) { toast(error.message,true); } };
   const regionCanvas = $("regionCanvas");
   regionCanvas.onpointerdown = event => { if (!state.regionEditor) return; const point=regionPoint(event); state.regionEditor.drawing={...point,width:0,height:0,kind:$("regionMode").value}; regionCanvas.setPointerCapture(event.pointerId); };
   regionCanvas.onpointermove = event => { if (!state.regionEditor?.drawing) return; const point=regionPoint(event),start=state.regionEditor.drawing; start.width=point.x-start.x; start.height=point.y-start.y; drawRegions(); };

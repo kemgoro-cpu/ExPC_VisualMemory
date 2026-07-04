@@ -397,38 +397,6 @@ class ContextPackService:
             raise PermissionError("Context pack is not approved or has expired")
         return pack
 
-    def set_redactions(
-        self, pack_id: str, event_id: int, redactions: list[dict[str, float]]
-    ) -> dict[str, Any]:
-        pack = self.get(pack_id, include_items=False)
-        if pack["status"] not in {"draft", "approved"}:
-            raise PackError("Only active context documents can be edited")
-        normalized_items = [
-            Redaction(
-                x=float(item["x"]),
-                y=float(item["y"]),
-                width=float(item["width"]),
-                height=float(item["height"]),
-            ).normalized()
-            for item in redactions
-        ]
-        normalized = [
-            {"x": item.x, "y": item.y, "width": item.width, "height": item.height}
-            for item in normalized_items
-        ]
-        row = self.db.fetchone(
-            "SELECT 1 FROM context_pack_item WHERE pack_id=? AND event_id=?", (pack_id, event_id)
-        )
-        if not row:
-            raise PackError("Pack item not found")
-        self.db.execute(
-            "UPDATE context_pack_item SET redactions_json=? WHERE pack_id=? AND event_id=?",
-            (json.dumps(normalized), pack_id, event_id),
-        )
-        if pack["status"] == "approved":
-            return self.approve(pack_id)
-        return self.get(pack_id, include_items=True)
-
     def approve(self, pack_id: str, expiry_hours: int | None = None) -> dict[str, Any]:
         pack = self.get(pack_id, include_items=True)
         if pack["status"] not in {"draft", "approved"}:

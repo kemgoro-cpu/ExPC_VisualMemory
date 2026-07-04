@@ -1,6 +1,11 @@
 # External PC Visual Memory
 
-キャプチャーボードから取得した別PCの画面を、ローカルで検索可能な履歴へ変換します。生の画面履歴はAIへ公開されません。検索UIで選んで作成したコンテキスト文書だけをMCPから取得できます。文書は作成時点で利用可能になり、作成後の墨消しにも追従して再生成されます。
+キャプチャーボードから取得した別PCの画面を、ローカルで検索可能な履歴へ変換します。生の画面履歴はAIへ公開されません。検索UIで選んで作成したコンテキスト文書だけをMCPから取得できます。
+
+## 0.2.2の主な変更
+
+- 個人利用構成に合わせ、墨消しのUI・APIとBitLocker確認処理を削除
+- 過去の文書に保存済みの墨消し情報は、再生成時の互換性維持のため引き続き適用
 
 ## 0.2.1の主な変更
 
@@ -24,7 +29,7 @@
 - 画面変化、静止、定期チェックポイントによる代表フレーム化
 - PaddleOCRによる日本語・英語OCRと多言語E5による意味検索
 - SQLite FTS5とローカル埋め込みを組み合わせた検索
-- 録画単位のタイムライン、録画ごとの全選択、ドラッグ複数選択、画像の墨消し
+- 録画単位のタイムライン、録画ごとの全選択、ドラッグ複数選択
 - 画像とスクラブ済みOCRを埋め込んだ単一HTML／PDFコンテキスト文書
 - 24時間を既定とするMCP利用期限と共有停止
 - 作成済みコンテキスト文書だけを公開するstdio MCPサーバー
@@ -90,9 +95,7 @@ visual-memory-mcp.exe
 
 ## データとセキュリティ
 
-既定の保存先は`%LOCALAPPDATA%\ExternalPCVisualMemory`です。APIは`127.0.0.1`にだけバインドし、ランダムトークンとCSRFトークンで保護します。保存先ドライブのBitLockerが確認できない場合はUIに警告します。
-
-画面画像は非常に機密性が高いため、Windowsユーザーを共有せず、BitLockerを有効にしてください。SSD上の削除を「安全消去」とは扱いません。
+既定の保存先は`%LOCALAPPDATA%\ExternalPCVisualMemory`です。APIは`127.0.0.1`にだけバインドし、ランダムトークンとCSRFトークンで保護します。
 
 ## テスト
 
@@ -109,7 +112,7 @@ python scripts/prefetch_models.py --output-dir work\model-bundle
 powershell -ExecutionPolicy Bypass -File scripts\build_release.ps1 -Profile Both
 ```
 
-出力名は`outputs\external-pc-visual-memory-lite-0.2.1`と`outputs\external-pc-visual-memory-full-0.2.1`です。各配布物にSHA-256、初回起動ガイド、MCP設定例を同梱します。
+出力名は`outputs\external-pc-visual-memory-lite-0.2.2`と`outputs\external-pc-visual-memory-full-0.2.2`です。各配布物にSHA-256、初回起動ガイド、MCP設定例を同梱します。
 
 ## GPU OCR（非商用プロファイル）
 

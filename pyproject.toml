@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "external-pc-visual-memory"
-version = "0.2.1"
+version = "0.2.2"
 description = "Local-first searchable visual memory for an external PC capture feed"
 readme = "README.md"
 requires-python = ">=3.12"

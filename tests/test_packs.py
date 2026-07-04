@@ -3,7 +3,6 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from conftest import add_event
-from PIL import Image
 
 from visual_memory import packs as packs_module
 
@@ -41,22 +40,13 @@ def test_external_program_environment_resets_pyinstaller_dll_directory(
     assert dll_directory_calls == [None, str(bundle_root)]
 
 
-def test_pack_is_immediately_available_and_redaction_rebuilds_outputs(service):
-    event_id = add_event(service, "secret visible text", color=255)
+def test_pack_is_immediately_available(service):
+    event_id = add_event(service, "visible text", color=255)
     pack = service.packs.create("Review", [event_id], note="Only this frame")
     assert service.packs.get_approved(pack["id"])["id"] == pack["id"]
-    approved = service.packs.set_redactions(
-        pack["id"], event_id, [{"x": 0.0, "y": 0.0, "width": 0.5, "height": 1.0}]
-    )
-    assert approved["status"] == "approved"
-    image_path = approved["items"][0]["image_path"]
-    with Image.open(image_path) as image:
-        assert image.getpixel((2, image.height // 2)) == (0, 0, 0)
-        assert image.getpixel((image.width - 2, image.height // 2))[0] > 200
-    assert service.packs.get_approved(pack["id"])["id"] == pack["id"]
 
 
-def test_redaction_removes_intersecting_ocr_from_all_pack_outputs(service):
+def test_legacy_redactions_remain_effective_when_rebuilding_existing_data(service):
     event_id = add_event(service, "secret line\npublic line", color=255)
     metadata = {
         "provider": "fake-ocr",
@@ -78,9 +68,15 @@ def test_redaction_removes_intersecting_ocr_from_all_pack_outputs(service):
         (json.dumps(metadata), event_id),
     )
     pack = service.packs.create("Scrub OCR", [event_id])
-    approved = service.packs.set_redactions(
-        pack["id"], event_id, [{"x": 0.0, "y": 0.0, "width": 0.5, "height": 1.0}]
+    service.db.execute(
+        "UPDATE context_pack_item SET redactions_json=? WHERE pack_id=? AND event_id=?",
+        (
+            json.dumps([{"x": 0.0, "y": 0.0, "width": 0.5, "height": 1.0}]),
+            pack["id"],
+            event_id,
+        ),
     )
+    approved = service.packs.approve(pack["id"])
 
     assert approved["items"][0]["ocr_text"] == "public line"
     artifact_dir = service.packs.artifact_dir(approved)
@@ -227,11 +223,7 @@ def test_failed_rebuild_is_unpublished_and_keeps_previous_artifact(monkeypatch, 
 
     monkeypatch.setattr(packs_module, "render_document_pages", fail_render)
     with pytest.raises(RuntimeError, match="simulated render failure"):
-        service.packs.set_redactions(
-            pack["id"],
-            event_id,
-            [{"x": 0, "y": 0, "width": 0.5, "height": 0.5}],
-        )
+        service.packs.approve(pack["id"])
 
     failed = service.packs.get(pack["id"])
     assert failed["status"] == "draft"

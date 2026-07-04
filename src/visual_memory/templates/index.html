@@ -82,19 +82,7 @@
     <div id="packList"></div>
   </dialog>
 
-  <dialog id="redactionDialog" class="redaction-dialog">
-    <button class="dialog-close" data-close="redactionDialog" aria-label="墨消し画面を閉じる">×</button>
-    <p class="eyebrow">REDACTION</p>
-    <h2>AIへ見せない範囲を黒塗り</h2>
-    <p class="muted">画像上をドラッグしてください。やり直す場合はクリアします。</p>
-    <div class="canvas-wrap"><canvas id="redactionCanvas"></canvas></div>
-    <div class="dialog-actions">
-      <button id="clearRedactions" class="ghost">クリア</button>
-      <button id="saveRedactions" class="primary">墨消しを保存</button>
-    </div>
-  </dialog>
-
-  <dialog id="regionDialog" class="redaction-dialog">
+  <dialog id="regionDialog" class="canvas-dialog">
     <button class="dialog-close" data-close="regionDialog" aria-label="差分領域画面を閉じる">×</button>
     <p class="eyebrow">CHANGE DETECTION</p>
     <h2>差分検出領域</h2>

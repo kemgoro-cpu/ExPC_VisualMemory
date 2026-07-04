@@ -96,20 +96,16 @@ class CreatePackRequest(BaseModel):
     deduplicate_overlaps: bool = True
 
 
-class RedactionShape(BaseModel):
+class RegionShape(BaseModel):
     x: float
     y: float
     width: float
     height: float
 
 
-class RedactionRequest(BaseModel):
-    redactions: list[RedactionShape] = Field(max_length=100)
-
-
 class CaptureRegionRequest(BaseModel):
-    ignore_regions: list[RedactionShape] = Field(default_factory=list, max_length=50)
-    watch_regions: list[RedactionShape] = Field(default_factory=list, max_length=50)
+    ignore_regions: list[RegionShape] = Field(default_factory=list, max_length=50)
+    watch_regions: list[RegionShape] = Field(default_factory=list, max_length=50)
 
 
 class ApprovalRequest(BaseModel):
@@ -196,7 +192,7 @@ def create_app(settings: Settings | None = None, service: VisualMemoryService | 
         if service.capture.status.state not in {"stopped", "failed"}:
             raise HTTPException(409, "Stop capture before changing detection regions")
 
-        def normalized(items: list[RedactionShape]) -> list[dict[str, float]]:
+        def normalized(items: list[RegionShape]) -> list[dict[str, float]]:
             result: list[dict[str, float]] = []
             for value in items:
                 item = Region(**value.model_dump()).normalized()
@@ -299,12 +295,6 @@ def create_app(settings: Settings | None = None, service: VisualMemoryService | 
     @app.get("/api/packs/{pack_id}")
     def get_pack(pack_id: str):
         return service.packs.get(pack_id, include_items=True)
-
-    @app.put("/api/packs/{pack_id}/items/{event_id}/redactions")
-    def set_redactions(pack_id: str, event_id: int, payload: RedactionRequest):
-        return service.packs.set_redactions(
-            pack_id, event_id, [item.model_dump() for item in payload.redactions]
-        )
 
     @app.post("/api/packs/{pack_id}/approve")
     def approve_pack(pack_id: str, payload: ApprovalRequest | None = None):
