@@ -40,6 +40,34 @@ def test_external_program_environment_resets_pyinstaller_dll_directory(
     assert dll_directory_calls == [None, str(bundle_root)]
 
 
+def test_looks_like_chrome_noise_detects_combined_menu_bar_line():
+    assert packs_module._looks_like_chrome_noise(
+        "表示(V) 移動(G) 実行(R) ターミナル(T) ヘルプ(H)"
+    )
+
+
+def test_looks_like_chrome_noise_detects_single_known_menu_item():
+    assert packs_module._looks_like_chrome_noise("表示(V)")
+    assert packs_module._looks_like_chrome_noise("ヘルプ(H)")
+
+
+def test_looks_like_chrome_noise_does_not_flag_ordinary_text_with_parens():
+    assert not packs_module._looks_like_chrome_noise("結果(暫定)を確認する")
+    assert not packs_module._looks_like_chrome_noise("四半期の売上高は前年比12.5%増")
+
+
+def test_important_ocr_excludes_menu_bar_lines():
+    text = (
+        "月次売上レポート\n"
+        "表示(V) 移動(G) 実行(R) ターミナル(T) ヘルプ(H)\n"
+        "第1四半期の売上高は前年比12.5%増"
+    )
+    important = packs_module._important_ocr(text)
+    assert "月次売上レポート" in important
+    assert "第1四半期の売上高は前年比12.5%増" in important
+    assert not any("移動(G)" in line for line in important)
+
+
 def test_pack_is_immediately_available(service):
     event_id = add_event(service, "visible text", color=255)
     pack = service.packs.create("Review", [event_id], note="Only this frame")
@@ -189,6 +217,45 @@ def test_automatic_title_prefers_clean_japanese_file_name(service):
     ]
     pack = service.packs.create("", event_ids)
     assert pack["title"] == "効率化グループの価値可視化"
+
+
+def test_automatic_title_ignores_mid_sentence_extension_mention(service):
+    # 「rendererではNode.jsを無効にし…」のような文中の言及はファイル名候補として
+    # 採用しない(以前は「rendererではNode」という拡張子除去済みの断片が
+    # タイトルになっていた)。ファイル名候補が無いので通常の候補行にフォールバックし、
+    # 途中で不自然に切れたタイトルにはならない
+    event_id = add_event(
+        service,
+        "rendererではNode.jsを無効にし、context isolationとsandboxを有効化する。",
+    )
+    pack = service.packs.create("", [event_id])
+    assert pack["title"] != "rendererではNode"
+
+
+def test_automatic_title_extracts_basename_from_editor_tab(service):
+    event_ids = [
+        add_event(service, "PLAN.md X", seconds=0),
+        add_event(service, "PLAN.md X", seconds=1),
+    ]
+    pack = service.packs.create("", event_ids)
+    assert pack["title"] == "PLAN"
+
+
+def test_automatic_title_extracts_basename_from_breadcrumb_path(service):
+    event_ids = [
+        add_event(
+            service,
+            "C: > Users > kemgo > Documents > Program > DevControlTower > PLAN.md",
+            seconds=0,
+        ),
+        add_event(
+            service,
+            "C: > Users > kemgo > Documents > Program > DevControlTower > PLAN.md",
+            seconds=1,
+        ),
+    ]
+    pack = service.packs.create("", event_ids)
+    assert pack["title"] == "PLAN"
 
 
 def test_html_has_compact_event_pages_ocr_appendix_and_technical_page(service):

@@ -16,6 +16,7 @@ from .capture import FrameCandidate, iso
 from .db import Database
 from .imaging import perceptual_hash, to_bgr
 from .storage import Storage
+from .textnorm import normalize_ocr_result
 
 LOGGER = logging.getLogger(__name__)
 
@@ -196,7 +197,7 @@ class EventProcessor:
     def _index_event(self, event_id: int, frame: np.ndarray) -> None:
         # OCRバックエンドは同時呼び出しを保証しないため、録画処理と手動再処理を直列化する。
         with self._index_lock:
-            ocr_result = self.ocr.recognize(frame)
+            ocr_result = normalize_ocr_result(self.ocr.recognize(frame))
             vector = self.embeddings.encode_document(ocr_result.text) if ocr_result.text else None
         metadata = json.dumps(
             {

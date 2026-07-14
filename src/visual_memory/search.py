@@ -10,6 +10,7 @@ import numpy as np
 
 from .ai import EmbeddingProvider
 from .db import Database
+from .textnorm import normalize_ocr_text
 
 TOKEN_RE = re.compile(r"[\w\-\.]+", re.UNICODE)
 
@@ -54,6 +55,7 @@ class SearchEngine:
         offset: int = 0,
     ) -> list[dict[str, Any]]:
         limit = max(1, min(limit, 200))
+        query = normalize_ocr_text(query)
         if not query.strip():
             where, params = self._time_clause(start, end)
             rows = self.db.fetchall(

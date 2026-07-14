@@ -57,6 +57,22 @@ def test_store_one_leaves_event_unindexed(settings):
     assert evidence is not None
 
 
+def test_process_one_normalizes_ocr_text_before_storing(settings):
+    # OCRが誤読(カタカナ混じりの誤字)を返しても、DBには正規化済みのテキストが
+    # 保存されること(_index_event内でnormalize_ocr_resultが適用される)
+    db = Database(settings.database_path)
+    db.initialize()
+    storage = Storage(settings)
+    ocr = QueueOcr(["テス卜を実行しました"])
+    processor = EventProcessor(db, storage, ocr, HashEmbedding())
+    _insert_session(db)
+
+    event_id = processor.process_one(_make_item())
+
+    row = db.fetchone("SELECT ocr_text FROM screen_event WHERE id=?", (event_id,))
+    assert row["ocr_text"] == "テストを実行しました"
+
+
 def test_background_indexer_processes_pending_events_when_capture_inactive(settings):
     db = Database(settings.database_path)
     db.initialize()

@@ -30,6 +30,14 @@ def test_japanese_substring_search_uses_trigram_with_short_query_fallback(servic
     assert service.search.search("噴射")[0]["id"] == event_id
 
 
+def test_ocr_text_normalization_makes_kana_confusables_searchable(service):
+    # OCRが"タ-ミナル"(ASCIIハイフン混入)と誤読しても、正規化後は"ターミナル"として
+    # 保存されるため、正しい表記でのクエリでヒットする
+    event_id = add_event(service, "タ-ミナルでコマンドを実行しました", seconds=1)
+
+    assert service.search.search("ターミナル")[0]["id"] == event_id
+
+
 def test_normalize_time_z_suffix_matches_db_stored_offset_format(service):
     first = add_event(service, "first", seconds=1)
     second = add_event(service, "second", seconds=20)

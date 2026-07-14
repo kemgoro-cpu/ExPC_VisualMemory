@@ -26,6 +26,7 @@ from .config import Settings
 from .db import Database
 from .imaging import Redaction, apply_redactions, sha256_bytes, sha256_file
 from .stitching import SourceFrame, render_document_pages
+from .textnorm import normalize_ocr_text
 
 LOGGER = logging.getLogger(__name__)
 
@@ -83,13 +84,22 @@ _NOISE_LABELS = {
     "コメント", "アクセシビリティ：検討が必要です",
     "アクセシビリティ: 検討が必要です",
 }
-_FILE_TITLE = re.compile(
-    r"(?i)(.+?\.(?:pptx?|docx?|xlsx?|pdf|py|ipynb|js|ts|tsx|jsx|java|cs|cpp|c|h))"
+_TITLE_EXTENSIONS = (
+    r"pptx?|docx?|xlsx?|pdf|py|ipynb|js|ts|tsx|jsx|java|cs|cpp|c|h"
+    r"|md|txt|ya?ml|json|html?|css"
 )
+_FILE_TITLE = re.compile(rf"(?i)(.+?\.(?:{_TITLE_EXTENSIONS}))")
+# ファイル名らしき部分の直後が日本語の続き(ひらがな・カタカナ・漢字)であれば、
+# 「rendererではNode.jsを無効にし」のような文中の言及であってファイル名の提示では
+# ないと判断する
+_MID_SENTENCE_CONTINUATION = re.compile(r"[ぁ-んァ-ヶー一-龠]")
 
 
 def _normalize_ocr_line(value: str) -> str:
-    return re.sub(r"\s+", " ", value).strip()
+    return re.sub(r"\s+", " ", normalize_ocr_text(value)).strip()
+
+
+_ACCESS_KEY_ITEM = re.compile(r"([^\s()]+)\(([A-Za-z])\)")
 
 
 def _looks_like_chrome_noise(value: str) -> bool:
@@ -97,9 +107,17 @@ def _looks_like_chrome_noise(value: str) -> bool:
     lowered = normalized.casefold()
     if not normalized or lowered in _NOISE_LABELS:
         return True
-    if len(normalized) <= 1 and not normalized.isalpha():
+    if len(normalized) <= 1:
         return True
     if re.fullmatch(r"[+×□○●△▽◇◆★☆※*%]+", normalized):
+        return True
+    # メニューバーの「表示(V) 移動(G) 実行(R)…」のようなアクセスキー付き項目が
+    # 1行に複数並ぶ行はメニューバー全体とみなして除去する
+    if len(_ACCESS_KEY_ITEM.findall(normalized)) >= 2:
+        return True
+    # 単独行でも、ラベル部分が既知のノイズ語彙(表示・ヘルプ等)に一致すれば除去する
+    single_access_key = _ACCESS_KEY_ITEM.fullmatch(normalized)
+    if single_access_key and single_access_key.group(1).casefold() in _NOISE_LABELS:
         return True
     ui_terms = (
         "ファイル", "ホーム", "挿入", "描画", "デザイン", "画面切り替え",
@@ -132,18 +150,18 @@ def _automatic_title(rows: list[Any]) -> str:
         for raw in str(row["ocr_text"] or "").splitlines():
             line = _normalize_ocr_line(raw)
             match = _FILE_TITLE.search(line)
-            if match:
+            trailing = line[match.end() :] if match else ""
+            if match and not _MID_SENTENCE_CONTINUATION.match(trailing):
                 title = re.sub(
                     r"(?i)\s*[-–—]\s*(PowerPoint|Word|Excel|Adobe Acrobat|Google Chrome|Microsoft Edge).*$",
                     "",
                     match.group(1),
                 ).strip()
                 title = re.sub(r"(?<=[ァ-ヶ])-+(?=[ァ-ヶ])", "ー", title)
-                title = re.sub(
-                    r"(?i)\.(?:pptx?|docx?|xlsx?|pdf|py|ipynb|js|ts|tsx|jsx|java|cs|cpp|c|h)$",
-                    "",
-                    title,
-                )
+                title = re.sub(rf"(?i)\.(?:{_TITLE_EXTENSIONS})$", "", title)
+                # パンくずリストやタブのパス表示(「C: > Users > … > PLAN.md」)から
+                # ファイル名部分だけを取り出す
+                title = re.split(r"\s*(?:>|\\|/)\s*", title)[-1].strip()
                 if title:
                     file_titles.append(title)
             if 5 <= len(line) <= 100 and not _looks_like_chrome_noise(line):
