@@ -94,6 +94,37 @@ def test_capture_regions_require_csrf_and_persist(settings, service):
         assert (settings.data_dir / "config.json").exists()
 
 
+def test_status_reports_background_indexer_state(settings, service):
+    app = create_app(settings, service)
+    with TestClient(app) as client:
+        response = client.get(f"/?token={settings.auth_token}", follow_redirects=False)
+        client.cookies.update(response.cookies)
+        status = client.get("/api/status").json()
+        assert "indexer" in status
+        assert set(status["indexer"]) == {
+            "state",
+            "pending_count",
+            "indexed_total",
+            "failures",
+            "last_error",
+            "last_indexed_at",
+        }
+
+
+def test_capture_preview_and_manual_require_running_capture(settings, service):
+    app = create_app(settings, service)
+    with TestClient(app) as client:
+        response = client.get(f"/?token={settings.auth_token}", follow_redirects=False)
+        client.cookies.update(response.cookies)
+        assert client.get("/api/capture/preview").status_code == 409
+        assert (
+            client.post(
+                "/api/capture/manual", headers={"X-CSRF-Token": settings.csrf_token}
+            ).status_code
+            == 409
+        )
+
+
 def test_event_history_supports_incremental_paging(settings, service):
     app = create_app(settings, service)
     with TestClient(app) as client:

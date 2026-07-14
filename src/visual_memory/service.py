@@ -14,7 +14,7 @@ from .capture import CaptureManager, list_directshow_devices
 from .config import Settings
 from .db import Database
 from .packs import ContextPackService
-from .processing import EventProcessor, RetentionService
+from .processing import BackgroundIndexer, EventProcessor, RetentionService
 from .search import SearchEngine
 from .storage import Storage
 
@@ -55,6 +55,13 @@ class VisualMemoryService:
             on_session_end=self._session_end,
             source_factory=source_factory,
         )
+        # OCR・埋め込みは1枚あたり数十秒かかりCPUを占有するため、記録中は行わず
+        # 記録停止後にBackgroundIndexerがまとめて処理する(プレビュー・手動キャプチャの応答性を守るため)
+        self.indexer = BackgroundIndexer(
+            self.db,
+            self.processor,
+            is_capture_active=lambda: self.capture.status.state not in {"stopped", "failed"},
+        )
         self._maintenance_stop = threading.Event()
         self._maintenance_thread: threading.Thread | None = None
 
@@ -65,6 +72,7 @@ class VisualMemoryService:
             if start:
                 start()
         self.processor.start()
+        self.indexer.start()
         self.packs.expire_due()
         self.retention.cleanup()
         if not self._maintenance_thread or not self._maintenance_thread.is_alive():
@@ -77,6 +85,7 @@ class VisualMemoryService:
     def stop(self) -> None:
         self.capture.stop()
         self.processor.stop()
+        self.indexer.stop()
         close_ocr = getattr(self.ocr, "close", None)
         if close_ocr:
             close_ocr()
@@ -104,6 +113,7 @@ class VisualMemoryService:
             "UPDATE capture_session SET ended_at=?,status=?,error=? WHERE id=?",
             (ended_at, "failed" if error else "stopped", error, session_id),
         )
+        self.indexer.notify()
 
     def list_devices(self) -> list[str]:
         return list_directshow_devices(self.settings.ffmpeg_path)
@@ -113,6 +123,7 @@ class VisualMemoryService:
         return {
             "capture": asdict(self.capture.status),
             "processor": asdict(self.processor.status),
+            "indexer": asdict(self.indexer.status),
             "ocr": {
                 "name": self.ocr.name,
                 "available": self.ocr.available,

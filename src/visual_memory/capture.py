@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
+import cv2
 import numpy as np
 
 from .config import Settings
@@ -301,6 +302,17 @@ class FFmpegFrameSource:
         self._stderr_thread = None
 
 
+class _ManualCaptureRequest:
+    """手動キャプチャ要求の受け渡し。eventのsetだけでは「保存完了」と「記録停止による解放」を
+    区別できないため、実際に保存要求まで到達したかをfulfilledで示す。"""
+
+    __slots__ = ("event", "fulfilled")
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.fulfilled = False
+
+
 @dataclass(slots=True)
 class CaptureStatus:
     state: str = "stopped"
@@ -310,6 +322,10 @@ class CaptureStatus:
     last_error: str | None = None
     reconnect_attempts: int = 0
     queue_drops: int = 0
+    session_started_at: str | None = None
+    candidates_emitted: int = 0
+    last_candidate_at: str | None = None
+    last_candidate_kind: str | None = None
 
 
 class CaptureManager:
@@ -331,6 +347,12 @@ class CaptureManager:
         self._thread: threading.Thread | None = None
         self._source: FrameSource | None = None
         self._lock = threading.Lock()
+        # プレビュー用に最新フレームの参照だけ保持する(コピーはエンコード時に行う)
+        self._preview_lock = threading.Lock()
+        self._latest_frame: np.ndarray | None = None
+        # 手動キャプチャは別スレッド(APIハンドラ)からの要求をキャプチャスレッドへ橋渡しする
+        self._manual_lock = threading.Lock()
+        self._manual_request: _ManualCaptureRequest | None = None
 
     def start(self, source_name: str) -> CaptureStatus:
         with self._lock:
@@ -352,9 +374,44 @@ class CaptureManager:
             self._thread.join(timeout=8)
         self.status.state = "stopped"
 
+    def latest_frame_jpeg(self, max_width: int = 960, quality: int = 80) -> bytes | None:
+        """直近のフレームを縮小JPEGへエンコードして返す(要求時にのみエンコードするため負荷は小さい)。"""
+        with self._preview_lock:
+            frame = self._latest_frame
+        if frame is None:
+            return None
+        height, width = frame.shape[:2]
+        if width > max_width:
+            scale = max_width / width
+            frame = cv2.resize(frame, (max_width, round(height * scale)), interpolation=cv2.INTER_AREA)
+        ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        if not ok:
+            return None
+        return encoded.tobytes()
+
+    def request_manual_capture(self, timeout: float = 3.0) -> bool:
+        """記録中のキャプチャスレッドへ即時保存を要求し、完了(またはタイムアウト)まで待つ。
+
+        タイムアウトした場合や、待機中に記録が停止した場合はFalseを返す。
+        """
+        if self.status.state not in {"running", "reconnecting", "starting"}:
+            raise RuntimeError("Capture is not running")
+        with self._manual_lock:
+            request = self._manual_request
+            if request is None:
+                request = _ManualCaptureRequest()
+                self._manual_request = request
+        if not request.event.wait(timeout):
+            return False
+        return request.fulfilled
+
     def _run(self, source_name: str) -> None:
         session_id = str(uuid.uuid4())
         self.status.session_id = session_id
+        self.status.session_started_at = iso(utcnow())
+        self.status.candidates_emitted = 0
+        self.status.last_candidate_at = None
+        self.status.last_candidate_kind = None
         self.on_session_start(session_id, source_name, iso(utcnow()))
         detector = ChangeDetector(
             stable_seconds=self.settings.stable_seconds,
@@ -378,9 +435,25 @@ class CaptureManager:
                         self.status.last_error = None
                         self.status.last_frame_at = iso(stamp)
                         self.status.state = "running"
-                        for candidate in detector.push(frame, time.monotonic(), stamp):
-                            if not self.on_candidate(session_id, candidate):
+                        with self._preview_lock:
+                            self._latest_frame = frame
+                        candidates = detector.push(frame, time.monotonic(), stamp)
+                        manual_request = self._take_manual_request()
+                        if manual_request is not None:
+                            candidates = [
+                                *candidates,
+                                FrameCandidate(frame.copy(), stamp, stamp, 0.0, "manual"),
+                            ]
+                        for candidate in candidates:
+                            accepted = self.on_candidate(session_id, candidate)
+                            if not accepted:
                                 self.status.queue_drops += 1
+                            if candidate.event_kind == "manual":
+                                manual_request.fulfilled = True
+                                manual_request.event.set()
+                            self.status.candidates_emitted += 1
+                            self.status.last_candidate_at = iso(stamp)
+                            self.status.last_candidate_kind = candidate.event_kind
                     if not self._stop.is_set():
                         raise RuntimeError("Capture stream ended")
                 except Exception as exc:
@@ -397,5 +470,23 @@ class CaptureManager:
                         self._source.close()
                         self._source = None
         finally:
+            with self._preview_lock:
+                self._latest_frame = None
+            self._release_pending_manual_request()
             self.on_session_end(session_id, iso(utcnow()), terminal_error)
             self.status.state = "stopped"
+
+    def _take_manual_request(self) -> _ManualCaptureRequest | None:
+        with self._manual_lock:
+            request = self._manual_request
+            self._manual_request = None
+            return request
+
+    def _release_pending_manual_request(self) -> None:
+        # 記録が止まる際、待機中の手動キャプチャ要求があれば解放してAPI側のタイムアウト待ちを避ける。
+        # fulfilledは立てないため、API側は保存失敗として扱える
+        with self._manual_lock:
+            request = self._manual_request
+            self._manual_request = None
+        if request is not None:
+            request.event.set()

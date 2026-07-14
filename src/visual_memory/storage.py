@@ -117,7 +117,9 @@ class Storage:
 
         image = to_pil(frame)
         with self._reconcile_lock:
-            image.save(frame_path, "WEBP", quality=self.settings.webp_quality, method=4)
+            image.save(
+                frame_path, "WEBP", quality=self.settings.webp_quality, method=self.settings.webp_method
+            )
             thumb = image.copy()
             thumb.thumbnail((self.settings.thumbnail_width, self.settings.thumbnail_width))
             thumb.save(thumbnail_path, "WEBP", quality=82, method=4)

@@ -7,7 +7,7 @@ from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -179,6 +179,33 @@ def create_app(settings: Settings | None = None, service: VisualMemoryService | 
     def capture_stop():
         service.capture.stop()
         return {"state": "stopped"}
+
+    @app.get("/api/capture/preview")
+    def capture_preview():
+        if service.capture.status.state not in {"running", "reconnecting", "starting"}:
+            raise HTTPException(409, "Capture is not running")
+        payload = service.capture.latest_frame_jpeg()
+        if payload is None:
+            raise HTTPException(404, "No frame available yet")
+        return Response(
+            content=payload,
+            media_type="image/jpeg",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Candidate-Count": str(service.capture.status.candidates_emitted),
+                "X-Capture-State": service.capture.status.state,
+            },
+        )
+
+    @app.post("/api/capture/manual")
+    def capture_manual():
+        try:
+            fulfilled = service.capture.request_manual_capture()
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        if not fulfilled:
+            raise HTTPException(504, "Manual capture was not completed (timed out or capture stopped)")
+        return {"state": "captured"}
 
     @app.get("/api/capture/regions")
     def capture_regions():

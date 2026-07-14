@@ -3,7 +3,11 @@ const state = {
   regionEditor: null, collapsedSessions: new Set(), knownSessions: new Set(),
   lastSelected: null, draggedBasketId: null, dragOverBasketId: null,
   offset: 0, hasMore: false, totalEvents: null, loadingEvents: false, status: null,
+  previewTimer: null, lastCandidateCount: null, previewObjectUrl: null,
+  statusInFlight: false, previewInFlight: false,
 };
+const EVENT_KIND_LABELS = { initial: "初回", motion: "動き", stable: "静止", heartbeat: "定期", manual: "手動" };
+function eventKindLabel(kind) { return EVENT_KIND_LABELS[kind] || kind; }
 const $ = (id) => document.getElementById(id);
 const csrf = () => document.cookie.split("; ").find(v => v.startsWith("vm_csrf="))?.split("=")[1] || "";
 const maxDocumentImages = Number(document.body.dataset.maxPackImages || 200);
@@ -35,6 +39,21 @@ function formatBytes(bytes) {
   return `${(bytes / 1024 ** i).toFixed(i > 2 ? 1 : 0)} ${units[i]}`;
 }
 function formatTime(value) { return new Date(value).toLocaleString("ja-JP", { dateStyle: "short", timeStyle: "medium" }); }
+function formatDuration(seconds) {
+  const total = Math.max(0, Math.floor(seconds));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const secs = total % 60;
+  const pad = (value) => String(value).padStart(2, "0");
+  return hours > 0 ? `${hours}:${pad(minutes)}:${pad(secs)}` : `${minutes}:${pad(secs)}`;
+}
+function formatAgo(isoString) {
+  const seconds = Math.max(0, Math.floor((Date.now() - new Date(isoString).getTime()) / 1000));
+  if (seconds < 60) return `${seconds}秒前`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}分前`;
+  return `${Math.floor(minutes / 60)}時間前`;
+}
 function escapeHtml(value = "") { const el = document.createElement("div"); el.textContent = value; return el.innerHTML; }
 function packStatusLabel(status) { return ({approved:"利用可能",expired:"期限切れ",revoked:"共有停止",draft:"未公開"})[status] || status; }
 
@@ -44,34 +63,109 @@ function syncCaptureControls() {
   const loadingModels = [status.ocr, status.embeddings].some(value => value.state === "loading");
   const checkingStorage = ["pending", "scanning"].includes(status.storage.state);
   const stopped = ["stopped", "failed"].includes(capture.state);
+  const recording = ["running", "reconnecting", "starting"].includes(capture.state);
   $("startCapture").disabled = !stopped || loadingModels || checkingStorage || !$("deviceSelect").value;
   $("stopCapture").disabled = stopped;
   $("deviceSelect").disabled = !stopped;
   $("refreshDevices").disabled = !stopped;
   $("regionSettings").disabled = !stopped;
+  $("manualCapture").disabled = !recording;
 }
 
 async function refreshStatus() {
+  // サーバーが索引処理などで重い間は前回のリクエストが残っていることがあるため、
+  // 多重発行を避けて詰まりを防ぐ
+  if (state.statusInFlight) return;
+  state.statusInFlight = true;
   try {
     const status = await api("/api/status"); const capture = status.capture;
     const badge = $("captureBadge"); badge.className = `status-badge ${capture.state}`;
     badge.innerHTML = `<span></span>${({running:"記録中", reconnecting:"再接続中", starting:"開始中", stopped:"停止中"})[capture.state] || capture.state}`;
-    $("metrics").innerHTML = `
-      <div class="metric"><strong>${status.processor.processed}</strong><span>処理イベント</span></div>
-      <div class="metric"><strong>${status.processor.queue_depth}</strong><span>索引待ち</span></div>
-      <div class="metric"><strong>${formatBytes(status.storage.used_bytes)}</strong><span>ローカル保存</span></div>
-      <div class="metric"><strong>${formatBytes(status.storage.disk_free_bytes)}</strong><span>空き容量</span></div>`;
+    const recording = ["running", "reconnecting", "starting"].includes(capture.state);
+    const indexer = status.indexer || { state: "idle", pending_count: 0 };
+    const metrics = [
+      `<div class="metric"><strong>${status.processor.processed}</strong><span>処理イベント</span></div>`,
+      `<div class="metric"><strong>${indexer.pending_count}</strong><span>索引待ち</span></div>`,
+      `<div class="metric"><strong>${formatBytes(status.storage.used_bytes)}</strong><span>ローカル保存</span></div>`,
+      `<div class="metric"><strong>${formatBytes(status.storage.disk_free_bytes)}</strong><span>空き容量</span></div>`,
+    ];
+    if (recording && capture.session_started_at) {
+      const elapsedSeconds = (Date.now() - new Date(capture.session_started_at).getTime()) / 1000;
+      metrics.push(`<div class="metric"><strong>${formatDuration(elapsedSeconds)}</strong><span>記録経過</span></div>`);
+      metrics.push(`<div class="metric"><strong>${capture.candidates_emitted}</strong><span>保存枚数</span></div>`);
+      if (capture.last_candidate_at) {
+        metrics.push(`<div class="metric"><strong>${formatAgo(capture.last_candidate_at)}</strong><span>最終保存 (${eventKindLabel(capture.last_candidate_kind)})</span></div>`);
+      }
+    }
+    $("metrics").innerHTML = metrics.join("");
     const warnings = [];
     if (status.ocr.state === "loading") warnings.push("OCRモデルを準備中です。準備が終わると記録を開始できます。");
     else if (!status.ocr.available) warnings.push(`OCR未導入: ${status.ocr.reason}`);
     if (status.embeddings.state === "loading") warnings.push("意味検索モデルを準備中です。文字検索は先に利用できます。");
     else if (!status.embeddings.available) warnings.push(`意味検索未導入: ${status.embeddings.reason}`);
     if (["pending", "scanning"].includes(status.storage.state)) warnings.push("保存容量を確認中です。");
-    if (status.processor.last_error) warnings.push(`索引処理: ${status.processor.last_error}`);
+    if (indexer.state === "paused-capture" && indexer.pending_count > 0) {
+      warnings.push(`${indexer.pending_count}枚は記録停止後に文字認識・検索登録されます。負荷を抑えるため記録中は索引処理を行いません。`);
+    } else if (indexer.state === "indexing") {
+      warnings.push(`文字認識・検索登録を処理中です。残り${indexer.pending_count}枚。`);
+    }
+    if (indexer.last_error) warnings.push(`索引処理: ${indexer.last_error}`);
+    if (status.processor.last_error) warnings.push(`保存処理: ${status.processor.last_error}`);
     if (capture.last_error) warnings.push(`キャプチャー: ${capture.last_error}`);
     $("systemWarnings").innerHTML = warnings.map(value => `<div class="warning">${escapeHtml(value)}</div>`).join("");
     state.status = status; syncCaptureControls();
+    updatePreviewVisibility(recording);
   } catch (error) { console.error(error); }
+  finally { state.statusInFlight = false; }
+}
+
+function updatePreviewVisibility(recording) {
+  const panel = $("previewPanel");
+  panel.hidden = !recording;
+  if (recording) {
+    if (!state.previewTimer && !document.hidden) {
+      refreshPreview();
+      state.previewTimer = setInterval(refreshPreview, 1000);
+    }
+  } else {
+    stopPreviewPolling();
+    state.lastCandidateCount = null;
+  }
+}
+
+function stopPreviewPolling() {
+  if (state.previewTimer) { clearInterval(state.previewTimer); state.previewTimer = null; }
+  if (state.previewObjectUrl) { URL.revokeObjectURL(state.previewObjectUrl); state.previewObjectUrl = null; }
+}
+
+async function refreshPreview() {
+  // 前回のプレビュー取得が終わっていない間は新しいリクエストを積まない。
+  // サーバーが重い時にリクエストが滞留してさらに負荷が増す悪循環を避ける
+  if (state.previewInFlight) return;
+  state.previewInFlight = true;
+  try {
+    const response = await fetch("/api/capture/preview", { cache: "no-store" });
+    if (!response.ok) return;
+    const count = Number(response.headers.get("X-Candidate-Count") || "0");
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const previous = state.previewObjectUrl;
+    $("previewImage").src = url;
+    state.previewObjectUrl = url;
+    if (previous) URL.revokeObjectURL(previous);
+    if (state.lastCandidateCount !== null && count > state.lastCandidateCount) triggerCaptureFeedback();
+    state.lastCandidateCount = count;
+    const lastCandidateAt = state.status?.capture?.last_candidate_at;
+    if (lastCandidateAt) $("previewCaption").textContent = `最終保存 ${formatAgo(lastCandidateAt)}`;
+  } catch (error) { /* プレビュー取得の一時的な失敗は次のポーリングで回復するため無視する */ }
+  finally { state.previewInFlight = false; }
+}
+
+function triggerCaptureFeedback() {
+  const flash = $("previewFlash"); const lamp = $("captureLamp");
+  flash.classList.remove("active"); void flash.offsetWidth; flash.classList.add("active");
+  lamp.classList.remove("active"); void lamp.offsetWidth; lamp.classList.add("active");
+  setTimeout(() => { flash.classList.remove("active"); lamp.classList.remove("active"); }, 650);
 }
 
 async function loadDevices() {
@@ -149,7 +243,7 @@ function renderEvents() {
       </header>
       ${collapsed ? "" : `<div class="session-event-grid" data-lasso-session="${sessionId}">
         ${events.map(event => `<article class="event-card ${state.selected.has(event.id) ? "selected" : ""}" data-event-id="${event.id}" tabindex="0" role="checkbox" aria-checked="${state.selected.has(event.id)}" aria-label="${formatTime(event.started_at)}の場面を選択">
-          <div class="event-image"><img draggable="false" loading="lazy" src="/api/events/${event.id}/frame?thumbnail=true" alt=""><span class="selection-mark">✓</span><span class="event-score">${event.event_kind}${event.score ? ` · ${(event.score * 1000).toFixed(1)}` : ""}</span></div>
+          <div class="event-image"><img draggable="false" loading="lazy" src="/api/events/${event.id}/frame?thumbnail=true" alt=""><span class="selection-mark">✓</span><span class="event-score">${eventKindLabel(event.event_kind)}${event.score ? ` · ${(event.score * 1000).toFixed(1)}` : ""}</span></div>
           <div class="event-body"><div class="event-time">${formatTime(event.started_at)}</div><div class="event-text">${escapeHtml(event.ocr_excerpt || "OCR待ち、または文字なし")}</div>
           <div class="event-actions"><label class="check-label"><input type="checkbox" data-select="${event.id}" ${state.selected.has(event.id) ? "checked" : ""}>選択</label><button class="ghost" data-detail="${event.id}">詳細</button></div></div>
         </article>`).join("")}
@@ -385,6 +479,16 @@ function regionPoint(event) {
 document.addEventListener("DOMContentLoaded", () => {
   $("refreshDevices").onclick = loadDevices; $("regionSettings").onclick = openRegionEditor; $("startCapture").onclick = async () => { const source_name = $("deviceSelect").value; if (!source_name) return toast("デバイスを選択してください。", true); try { await api("/api/capture/start", {method:"POST",body:{source_name}}); toast("記録を開始しました。"); refreshStatus(); } catch(error) { toast(error.message,true); } };
   $("stopCapture").onclick = async () => { try { await api("/api/capture/stop", {method:"POST"}); toast("記録を停止しました。"); refreshStatus(); } catch(error) { toast(error.message,true); } };
+  $("manualCapture").onclick = async () => {
+    const button = $("manualCapture"); const label = button.textContent;
+    button.disabled = true; button.textContent = "キャプチャ中…";
+    try {
+      await api("/api/capture/manual", {method:"POST"});
+      triggerCaptureFeedback();
+      toast("手動キャプチャを保存しました。");
+    } catch (error) { toast(error.message, true); }
+    finally { button.textContent = label; syncCaptureControls(); }
+  };
   $("searchForm").onsubmit = event => { event.preventDefault(); searchEvents(); }; $("createPack").onclick = createPack; $("showPacks").onclick = showPacks;
   $("loadMore").onclick = () => searchEvents(true);
   $("deviceSelect").onchange = () => { if ($("deviceSelect").value) localStorage.setItem("visual-memory-device", $("deviceSelect").value); syncCaptureControls(); };
@@ -405,6 +509,7 @@ document.addEventListener("DOMContentLoaded", () => {
     if (document.hidden) {
       clearInterval(statusInterval);
       statusInterval = null;
+      stopPreviewPolling();
     } else {
       refreshStatus();
       if (statusInterval === null) statusInterval = setInterval(refreshStatus, 5000);

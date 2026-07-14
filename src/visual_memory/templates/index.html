@@ -29,6 +29,17 @@
         <button id="stopCapture" class="danger">停止</button>
         <button id="regionSettings" class="ghost">差分領域</button>
       </div>
+      <div id="previewPanel" class="preview-panel" hidden>
+        <div class="preview-frame">
+          <img id="previewImage" alt="キャプチャ中のプレビュー">
+          <div id="previewFlash" class="preview-flash"></div>
+          <div class="preview-overlay">
+            <span id="captureLamp" class="capture-lamp"></span>
+            <span id="previewCaption" class="preview-caption"></span>
+          </div>
+        </div>
+        <button id="manualCapture" class="primary">今すぐキャプチャ</button>
+      </div>
       <div id="systemWarnings" class="warnings"></div>
       <div class="metrics" id="metrics"></div>
     </section>

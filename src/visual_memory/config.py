@@ -79,6 +79,10 @@ class Settings:
     max_pack_images: int = 200
     pack_warning_images: int = 50
     webp_quality: int = 90
+    # WebPのmethod=4は圧縮率が高い分エンコードが遅い(1080pで実測約350ms)。
+    # 記録中は保存が頻繁に発生しCPUを取り合うため、2(実測約130ms)に下げて
+    # プレビュー配信やAPI応答に回せるCPU時間を優先する
+    webp_method: int = 2
     thumbnail_width: int = 360
     ocr_provider: str = "paddle"
     ocr_device: str = "auto"

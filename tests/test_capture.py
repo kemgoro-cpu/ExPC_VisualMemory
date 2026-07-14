@@ -1,8 +1,10 @@
 import sys
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 
 import numpy as np
+import pytest
 
 from visual_memory.capture import CaptureManager, ChangeDetector, FFmpegFrameSource, parse_directshow_devices
 from visual_memory.config import Settings
@@ -164,3 +166,109 @@ def test_capture_reconnect_clears_transient_session_error(tmp_path):
     assert attempts >= 2
     assert ended[0][2] is None
     assert manager.status.last_error is None
+
+
+def test_latest_frame_jpeg_is_none_before_any_frame(tmp_path):
+    settings = Settings(data_dir=tmp_path / "data")
+    manager = CaptureManager(
+        settings,
+        on_candidate=lambda *_: True,
+        on_session_start=lambda *_: None,
+        on_session_end=lambda *_: None,
+    )
+    assert manager.latest_frame_jpeg() is None
+
+
+def test_manual_capture_requires_running_state(tmp_path):
+    settings = Settings(data_dir=tmp_path / "data")
+    manager = CaptureManager(
+        settings,
+        on_candidate=lambda *_: True,
+        on_session_start=lambda *_: None,
+        on_session_end=lambda *_: None,
+    )
+    with pytest.raises(RuntimeError):
+        manager.request_manual_capture(timeout=0.1)
+
+
+def test_manual_capture_emits_candidate_and_updates_progress(tmp_path):
+    settings = Settings(data_dir=tmp_path / "data", capture_width=8, capture_height=8)
+    candidates = []
+    got_first_frame = threading.Event()
+
+    class Source:
+        def frames(self, stop_event):
+            frame = np.zeros((8, 8, 3), dtype=np.uint8)
+            while not stop_event.is_set():
+                yield frame
+                got_first_frame.set()
+                stop_event.wait(0.05)
+
+        def close(self):
+            return None
+
+    def on_candidate(_session_id, candidate):
+        candidates.append(candidate)
+        return True
+
+    manager = CaptureManager(
+        settings,
+        on_candidate=on_candidate,
+        on_session_start=lambda *_: None,
+        on_session_end=lambda *_: None,
+        source_factory=lambda _name: Source(),
+    )
+    manager.start("capture")
+    assert got_first_frame.wait(2)
+
+    frame_jpeg = manager.latest_frame_jpeg()
+    assert frame_jpeg is not None
+    assert frame_jpeg[:2] == b"\xff\xd8"  # JPEGマジックバイト
+
+    fulfilled = manager.request_manual_capture(timeout=2)
+    manager.stop()
+
+    assert fulfilled is True
+    assert [item.event_kind for item in candidates].count("manual") == 1
+    assert manager.status.candidates_emitted >= 2  # 初回自動候補 + 手動候補
+    assert manager.status.last_candidate_kind is not None
+    assert manager.status.session_started_at is not None
+
+
+def test_manual_capture_reports_failure_when_capture_stops_while_waiting(tmp_path):
+    # 手動キャプチャを待っている間に記録が停止した場合、
+    # 「保存成功」ではなくFalse(失敗)が返ることを確認する
+    settings = Settings(data_dir=tmp_path / "data", capture_width=8, capture_height=8)
+    got_first_frame = threading.Event()
+
+    class Source:
+        def frames(self, stop_event):
+            # 最初の1フレームだけ流し、その後は停止まで新しいフレームを出さない。
+            # 手動キャプチャ要求は次フレーム処理まで実行されないため、待機状態を再現できる
+            yield np.zeros((8, 8, 3), dtype=np.uint8)
+            got_first_frame.set()
+            stop_event.wait(5)
+
+        def close(self):
+            return None
+
+    manager = CaptureManager(
+        settings,
+        on_candidate=lambda *_: True,
+        on_session_start=lambda *_: None,
+        on_session_end=lambda *_: None,
+        source_factory=lambda _name: Source(),
+    )
+    manager.start("capture")
+    assert got_first_frame.wait(2)
+
+    results: list[bool] = []
+    waiter = threading.Thread(
+        target=lambda: results.append(manager.request_manual_capture(timeout=5)), daemon=True
+    )
+    waiter.start()
+    time.sleep(0.2)  # 要求が登録されるのを待つ
+    manager.stop()
+    waiter.join(timeout=2)
+
+    assert results == [False]

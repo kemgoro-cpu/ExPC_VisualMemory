@@ -236,6 +236,9 @@ class PaddleOcrProvider:
             model_options["text_recognition_model_name"] = "PP-OCRv6_medium_rec"
             model_options["text_recognition_model_dir"] = recognition_model_dir
         model_options["device"] = "gpu:0" if active_device == "cuda" else active_device
+        # OCRの認識時間そのものは変わらないが、CPUスレッドを絞ることでWebサーバーや
+        # キャプチャスレッドにCPUを譲りやすくする(索引処理中の応答性のため)
+        model_options["cpu_threads"] = 4
         try:
             self.engine = PaddleOCR(
                 lang=None if model_options else language,
@@ -455,8 +458,12 @@ class SentenceTransformerEmbedding:
     reason = None
 
     def __init__(self, model_name: str):
+        import torch
         from sentence_transformers import SentenceTransformer
 
+        # デフォルトの論理コア数(このマシンで14)をそのまま使うとWebサーバーや
+        # キャプチャスレッドからCPUを奪ってしまうため、索引処理中も譲れるよう絞る
+        torch.set_num_threads(4)
         self.name = model_name
         self.model = SentenceTransformer(model_name, device="cpu")
         if hasattr(self.model, "get_embedding_dimension"):

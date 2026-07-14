@@ -5,6 +5,7 @@ import logging
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -119,7 +120,12 @@ class EventProcessor:
         self.status.queue_drops = self.queue.drops
         return accepted_without_drop
 
-    def process_one(self, item: ProcessingItem) -> int:
+    def store_one(self, item: ProcessingItem) -> int:
+        """フレームを保存してscreen_eventを作成する。OCR・埋め込みは行わない(processed_atはNULLのまま)。
+
+        キャプチャ中はこのメソッドのみを呼び、索引処理(_index_event)はBackgroundIndexerが
+        記録停止後にまとめて実行することでCPU負荷を分離する。
+        """
         if not self.storage.has_capacity():
             self.status.state = "blocked-storage"
             raise RuntimeError("Storage limit or minimum free-space threshold reached")
@@ -156,6 +162,11 @@ class EventProcessor:
                VALUES(?, 'frame', ?, 'image/webp', ?, '{}', ?)""",
             (event_id, str(stored.frame_path), stored.sha256, iso(datetime.now(UTC))),
         )
+        return event_id
+
+    def process_one(self, item: ProcessingItem) -> int:
+        """保存 + 索引を同期的に行う(テスト・後方互換用)。通常の記録中はstore_oneのみが使われる。"""
+        event_id = self.store_one(item)
         try:
             self._index_event(event_id, item.candidate.frame)
         except Exception as exc:
@@ -226,15 +237,133 @@ class EventProcessor:
             if item is None:
                 continue
             try:
-                self.process_one(item)
+                self.store_one(item)
                 self.status.processed += 1
                 self.status.last_processed_at = iso(datetime.now(UTC))
             except Exception as exc:
-                LOGGER.exception("Event processing failed")
+                LOGGER.exception("Event storage failed")
                 self.status.failures += 1
                 self.status.last_error = str(exc)
             self.status.queue_depth = len(self.queue)
             self.status.queue_drops = self.queue.drops
+
+
+@dataclass(slots=True)
+class IndexerStatus:
+    state: str = "idle"  # idle | indexing | paused-capture
+    pending_count: int = 0
+    indexed_total: int = 0
+    failures: int = 0
+    last_error: str | None = None
+    last_indexed_at: str | None = None
+
+
+class BackgroundIndexer:
+    """未索引(processed_at IS NULL)のイベントを古い順にOCR・埋め込み(索引)処理する。
+
+    CPUでのOCRは1枚あたり数十秒かかる重い処理のため、キャプチャ中に同時実行すると
+    CPUを占有しプレビュー・手動キャプチャの応答が遅れる。既定では記録中は待機し、
+    停止している間だけ処理する。ただしOCRが別プロセスワーカー(GPU)で動いている
+    構成ではメインプロセスの負荷が小さいため、allow_during_captureで記録中の
+    処理継続を許可できる(準リアルタイムに検索へ反映される)。
+    """
+
+    def __init__(
+        self,
+        db: Database,
+        processor: EventProcessor,
+        is_capture_active: Callable[[], bool],
+        allow_during_capture: Callable[[], bool] | None = None,
+        poll_interval: float = 2.0,
+        idle_interval: float = 10.0,
+        max_attempts: int = 3,
+    ):
+        self.db = db
+        self.processor = processor
+        self.is_capture_active = is_capture_active
+        # OCRが別プロセスワーカー(GPU)で動いている等、メインプロセスのCPUを
+        # 奪わない構成のときだけ記録中の索引を許可するための判定フック
+        self.allow_during_capture = allow_during_capture or (lambda: False)
+        self.poll_interval = poll_interval
+        self.idle_interval = idle_interval
+        self.max_attempts = max_attempts
+        self.status = IndexerStatus()
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._attempts: dict[int, int] = {}
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="background-indexer")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._wake.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=15)
+
+    def notify(self) -> None:
+        """記録停止時などに呼び出し、待機中のポーリング間隔を待たずに再確認させる。"""
+        self._wake.set()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            if self.is_capture_active() and not self.allow_during_capture():
+                self.status.state = "paused-capture"
+                self._refresh_pending_count()
+                self._wake.wait(self.poll_interval)
+                self._wake.clear()
+                continue
+            row = self._next_pending()
+            if row is None:
+                self.status.state = "idle"
+                self.status.pending_count = 0
+                self._wake.wait(self.idle_interval)
+                self._wake.clear()
+                continue
+            self.status.state = "indexing"
+            # 1枚の処理には数十秒かかることがあるため、処理前に残数を更新しておく
+            # (起動直後のバックログ処理で「残り0枚」と表示されるのを防ぐ)
+            self._refresh_pending_count()
+            self._process_row(row)
+
+    def _next_pending(self):
+        return self.db.fetchone(
+            "SELECT id, frame_path FROM screen_event WHERE processed_at IS NULL ORDER BY started_at LIMIT 1"
+        )
+
+    def _refresh_pending_count(self) -> None:
+        row = self.db.fetchone("SELECT COUNT(*) AS count FROM screen_event WHERE processed_at IS NULL")
+        self.status.pending_count = int(row["count"]) if row else 0
+
+    def _process_row(self, row) -> None:
+        event_id = int(row["id"])
+        try:
+            with self.processor.storage.open_image(row["frame_path"]) as image:
+                frame = to_bgr(image)
+            self.processor._index_event(event_id, frame)
+            self.status.indexed_total += 1
+            self.status.last_indexed_at = iso(datetime.now(UTC))
+            self._attempts.pop(event_id, None)
+        except Exception as exc:
+            LOGGER.exception("Background indexing failed for event %s", event_id)
+            self.status.failures += 1
+            self.status.last_error = str(exc)
+            attempts = self._attempts.get(event_id, 0) + 1
+            self._attempts[event_id] = attempts
+            if attempts >= self.max_attempts:
+                # 無限リトライを防ぐため、失敗のまま処理済みとしてマークして次へ進む
+                self.db.execute(
+                    "UPDATE screen_event SET processed_at=? WHERE id=?",
+                    (iso(datetime.now(UTC)), event_id),
+                )
+                self._attempts.pop(event_id, None)
+        finally:
+            self._refresh_pending_count()
 
 
 class RetentionService:

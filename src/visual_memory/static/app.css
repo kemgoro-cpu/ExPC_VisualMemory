@@ -46,10 +46,27 @@ button.wide { width: 100%; margin-top: 4px; }
 .status-badge.running span { background: var(--accent); box-shadow: 0 0 12px var(--accent); }
 .status-badge.reconnecting { color: var(--warning); }
 .status-badge.reconnecting span { background: var(--warning); }
-.metrics { display: grid; grid-template-columns: repeat(4, minmax(110px, 1fr)); gap: 10px; margin-top: 14px; }
+.metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px; margin-top: 14px; }
 .metric { padding: 10px 12px; border: 1px solid var(--line); border-radius: 9px; }
 .metric strong { display: block; font: 700 16px ui-monospace, monospace; }
 .metric span { color: var(--muted); font-size: 11px; }
+.preview-panel { margin-top: 14px; display: grid; gap: 10px; max-width: 480px; }
+/* display:grid指定はUAスタイルの[hidden]{display:none}より優先されてしまうため、明示的に打ち消す */
+.preview-panel[hidden] { display: none; }
+.preview-frame { position: relative; max-width: 480px; border-radius: 10px; overflow: hidden; background: #050607; border: 1px solid var(--line); }
+.preview-frame img { display: block; width: 100%; aspect-ratio: 16/9; object-fit: contain; background: #050607; }
+.preview-flash { position: absolute; inset: 0; background: #fff; opacity: 0; pointer-events: none; }
+.preview-flash.active { animation: preview-flash-anim .6s ease-out; }
+@keyframes preview-flash-anim { 0% { opacity: 0; } 15% { opacity: .75; } 100% { opacity: 0; } }
+.preview-overlay { position: absolute; left: 10px; bottom: 10px; display: flex; align-items: center; gap: 8px; background: rgba(0,0,0,.55); border-radius: 999px; padding: 5px 10px; }
+.capture-lamp { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: #5b6570; transition: background .15s; }
+.capture-lamp.active { background: var(--danger); box-shadow: 0 0 10px 2px var(--danger); animation: preview-lamp-anim .6s ease-out; }
+@keyframes preview-lamp-anim { 0% { box-shadow: 0 0 14px 4px var(--danger); } 100% { box-shadow: 0 0 10px 2px var(--danger); } }
+.preview-caption { color: var(--text); font-size: 11px; }
+@media (prefers-reduced-motion: reduce) {
+  .preview-flash.active { animation: none; }
+  .capture-lamp.active { animation: none; }
+}
 .warnings { margin-top: 12px; }
 .warning { color: var(--warning); font-size: 13px; padding: 8px 10px; background: rgba(255,200,87,.07); border-left: 2px solid var(--warning); }
 .workspace { display: grid; grid-template-columns: minmax(0, 1fr) 310px; gap: 20px; align-items: start; }
@@ -146,6 +163,8 @@ dialog::backdrop { background: rgba(0,0,0,.7); backdrop-filter: blur(5px); }
   .search-query { grid-column: auto; }
   .search-form button { width: 100%; }
   select { min-width: 0; max-width: 100%; }
+  .preview-frame { max-width: 100%; }
+  #manualCapture { width: 100%; }
   .metrics { grid-template-columns: 1fr; }
   .recording-header { grid-template-columns: auto minmax(0,1fr); }
   .session-select { grid-column: 1 / -1; justify-self: stretch; }
