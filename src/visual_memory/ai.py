@@ -104,6 +104,11 @@ class AsyncOcrProvider:
             return self._provider.reason
         return self._error or "OCR model is loading"
 
+    @property
+    def fallback_reason(self) -> str | None:
+        """GPUワーカー起動失敗などでCPUへフォールバックした場合の理由(通常はNone)。"""
+        return getattr(self._provider, "fallback_reason", None)
+
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
@@ -484,6 +489,23 @@ class SentenceTransformerEmbedding:
         return self._encode(f"query: {text}") if text else None
 
 
+def _build_inprocess_provider(
+    provider_name: str,
+    detection_model_dir: str | None,
+    recognition_model_dir: str | None,
+    device: str,
+) -> OcrProvider:
+    if provider_name in {"yomitoku", "yomitoku-lite"}:
+        return YomiTokuOcrProvider(lite=provider_name.endswith("-lite"), device=device)
+    if provider_name != "paddle":
+        return DisabledOcr(f"Unknown OCR provider: {provider_name}")
+    return PaddleOcrProvider(
+        detection_model_dir=detection_model_dir,
+        recognition_model_dir=recognition_model_dir,
+        device=device,
+    )
+
+
 def build_ocr_provider(
     provider_name: str = "paddle",
     detection_model_dir: str | None = None,
@@ -493,17 +515,26 @@ def build_ocr_provider(
 ) -> OcrProvider:
     if provider_name == "disabled":
         return DisabledOcr("OCR is disabled in config")
-    try:
-        if worker_python:
+    if worker_python:
+        try:
             return SubprocessOcrProvider(worker_python, provider_name, device)
-        if provider_name in {"yomitoku", "yomitoku-lite"}:
-            return YomiTokuOcrProvider(lite=provider_name.endswith("-lite"), device=device)
-        if provider_name != "paddle":
-            return DisabledOcr(f"Unknown OCR provider: {provider_name}")
-        return PaddleOcrProvider(
-            detection_model_dir=detection_model_dir,
-            recognition_model_dir=recognition_model_dir,
-            device=device,
+        except Exception as exc:
+            # GPUワーカーが起動できなくてもOCRを完全停止させず、インプロセスCPUで継続する。
+            # deviceを"cpu"に固定するのは、ワーカー分離の理由だったCUDA DLL競合を
+            # メインプロセスへ持ち込まないため
+            LOGGER.warning("OCR worker failed to start; falling back to in-process CPU OCR: %s", exc)
+            try:
+                fallback = _build_inprocess_provider(
+                    provider_name, detection_model_dir, recognition_model_dir, "cpu"
+                )
+            except Exception as inner:
+                LOGGER.warning("%s OCR unavailable: %s", provider_name, inner)
+                return DisabledOcr(f"Unable to initialize {provider_name} OCR: {inner}")
+            fallback.fallback_reason = f"OCR worker failed to start: {exc}"
+            return fallback
+    try:
+        return _build_inprocess_provider(
+            provider_name, detection_model_dir, recognition_model_dir, device
         )
     except Exception as exc:
         LOGGER.warning("%s OCR unavailable: %s", provider_name, exc)

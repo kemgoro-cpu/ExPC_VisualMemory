@@ -66,6 +66,51 @@ def test_unknown_ocr_provider_fails_closed():
     assert "Unknown OCR provider" in provider.reason
 
 
+def test_worker_failure_falls_back_to_inprocess_cpu(monkeypatch):
+    # GPUワーカーの起動失敗時、OCR全停止(DisabledOcr)ではなく
+    # インプロセスCPUプロバイダへフォールバックすること
+    import visual_memory.ai as ai_module
+
+    class FakeInprocess:
+        name = "fake-cpu-paddle"
+        available = True
+        reason = None
+
+        def recognize(self, frame):
+            return OcrResult("", None, [])
+
+    captured_device = {}
+
+    def fake_build(provider_name, detection_model_dir, recognition_model_dir, device):
+        captured_device["value"] = device
+        return FakeInprocess()
+
+    monkeypatch.setattr(ai_module, "_build_inprocess_provider", fake_build)
+    # 存在しないパスのpythonを指定してワーカー起動を確実に失敗させる
+    provider = build_ocr_provider("paddle", worker_python=r"C:\does\not\exist\python.exe")
+
+    assert provider.available
+    assert provider.name == "fake-cpu-paddle"
+    assert "OCR worker failed to start" in provider.fallback_reason
+    assert captured_device["value"] == "cpu"  # CUDA DLL競合を避けるためCPU固定
+
+
+def test_async_ocr_provider_exposes_fallback_reason():
+    class FallbackOcr:
+        name = "cpu-fallback"
+        available = True
+        reason = None
+        fallback_reason = "OCR worker failed to start: boom"
+
+        def recognize(self, frame):
+            return OcrResult("", None, [])
+
+    provider = AsyncOcrProvider(FallbackOcr)
+    assert provider.fallback_reason is None  # ロード完了前はNone
+    provider.recognize(np.zeros((2, 2, 3), dtype=np.uint8))
+    assert provider.fallback_reason == "OCR worker failed to start: boom"
+
+
 def test_subprocess_worker_reports_initialization_failure_without_protocol_corruption():
     with pytest.raises(RuntimeError, match="Unknown OCR provider"):
         SubprocessOcrProvider(sys.executable, "not-real", "cpu")

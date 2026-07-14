@@ -109,6 +109,9 @@ async function refreshStatus() {
     } else if (indexer.state === "indexing") {
       warnings.push(`文字認識・検索登録を処理中です。残り${indexer.pending_count}枚。`);
     }
+    if (status.ocr.fallback_reason) {
+      warnings.push(`GPU OCRの起動に失敗したためCPUで動作中です。索引が遅くなります: ${status.ocr.fallback_reason}`);
+    }
     if (indexer.last_error) warnings.push(`索引処理: ${indexer.last_error}`);
     if (status.processor.last_error) warnings.push(`保存処理: ${status.processor.last_error}`);
     if (capture.last_error) warnings.push(`キャプチャー: ${capture.last_error}`);

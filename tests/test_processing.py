@@ -120,6 +120,40 @@ def test_background_indexer_pauses_while_capture_is_active(settings):
         indexer.stop()
 
 
+def test_background_indexer_runs_during_capture_when_allowed(settings):
+    # GPUワーカー構成(allow_during_capture=True)では、記録中でも索引が進むこと
+    db = Database(settings.database_path)
+    db.initialize()
+    storage = Storage(settings)
+    ocr = QueueOcr(["リアルタイム索引"])
+    processor = EventProcessor(db, storage, ocr, HashEmbedding())
+    _insert_session(db)
+    event_id = processor.store_one(_make_item())
+
+    indexer = BackgroundIndexer(
+        db,
+        processor,
+        is_capture_active=lambda: True,  # 記録中のまま
+        allow_during_capture=lambda: True,
+        poll_interval=0.05,
+        idle_interval=0.05,
+    )
+    indexer.start()
+    try:
+        deadline = time.time() + 5
+        row = None
+        while time.time() < deadline:
+            row = db.fetchone("SELECT ocr_text, processed_at FROM screen_event WHERE id=?", (event_id,))
+            if row["processed_at"]:
+                break
+            time.sleep(0.05)
+    finally:
+        indexer.stop()
+
+    assert row["processed_at"] is not None
+    assert row["ocr_text"] == "リアルタイム索引"
+
+
 def test_background_indexer_gives_up_after_max_attempts(settings):
     db = Database(settings.database_path)
     db.initialize()

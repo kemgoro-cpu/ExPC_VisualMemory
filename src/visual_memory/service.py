@@ -55,12 +55,15 @@ class VisualMemoryService:
             on_session_end=self._session_end,
             source_factory=source_factory,
         )
-        # OCR・埋め込みは1枚あたり数十秒かかりCPUを占有するため、記録中は行わず
-        # 記録停止後にBackgroundIndexerがまとめて処理する(プレビュー・手動キャプチャの応答性を守るため)
+        # CPUでのOCR・埋め込みは1枚あたり数十秒かかりCPUを占有するため、既定では記録中は行わず
+        # 記録停止後にBackgroundIndexerがまとめて処理する(プレビュー・手動キャプチャの応答性を守るため)。
+        # OCRが別プロセスワーカー(GPU)で動いている場合はメインプロセスの負荷が小さいので、
+        # 記録中も索引を継続して準リアルタイムに検索へ反映する
         self.indexer = BackgroundIndexer(
             self.db,
             self.processor,
             is_capture_active=lambda: self.capture.status.state not in {"stopped", "failed"},
+            allow_during_capture=lambda: self.ocr.name.startswith("worker:"),
         )
         self._maintenance_stop = threading.Event()
         self._maintenance_thread: threading.Thread | None = None
@@ -128,6 +131,7 @@ class VisualMemoryService:
                 "name": self.ocr.name,
                 "available": self.ocr.available,
                 "reason": self.ocr.reason,
+                "fallback_reason": getattr(self.ocr, "fallback_reason", None),
                 "state": getattr(
                     self.ocr,
                     "state",

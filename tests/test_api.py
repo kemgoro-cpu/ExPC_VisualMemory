@@ -111,6 +111,17 @@ def test_status_reports_background_indexer_state(settings, service):
         }
 
 
+def test_status_reports_ocr_fallback_reason(settings, service):
+    # GPUワーカー失敗時のCPUフォールバック理由(通常はNone)がUIへ届くこと
+    app = create_app(settings, service)
+    with TestClient(app) as client:
+        response = client.get(f"/?token={settings.auth_token}", follow_redirects=False)
+        client.cookies.update(response.cookies)
+        status = client.get("/api/status").json()
+        assert "fallback_reason" in status["ocr"]
+        assert status["ocr"]["fallback_reason"] is None
+
+
 def test_capture_preview_and_manual_require_running_capture(settings, service):
     app = create_app(settings, service)
     with TestClient(app) as client:
