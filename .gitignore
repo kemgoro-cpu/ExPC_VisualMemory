@@ -28,3 +28,6 @@ tmp/
 
 # Downloaded model bundles
 assets/models/
+
+# Dev Control Tower の登録メタデータ（ローカル管理のため無視）
+.devcontrol/
