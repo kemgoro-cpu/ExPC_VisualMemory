@@ -4,21 +4,72 @@ import json
 import logging
 import threading
 import time
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import numpy as np
 
-from .ai import EmbeddingProvider, OcrProvider
+from .ai import EmbeddingProvider, OcrProvider, OcrResult
 from .capture import FrameCandidate, iso
 from .db import Database
 from .imaging import perceptual_hash, to_bgr
 from .storage import Storage
-from .textnorm import normalize_ocr_result
+from .textnorm import clean_ocr_lines, line_key, normalize_ocr_result
 
 LOGGER = logging.getLogger(__name__)
+
+
+class ChromeLineTracker:
+    """記録中のセッションで「繰り返し出現する行」を追跡する。
+
+    タスクバーのアプリ名のように、文字のパターンだけでは本文と区別できないが
+    「毎フレーム同じ位置に出続ける」ノイズを見つけるための仕組み。コンテキストパック
+    生成側(packs._clean_ocr_items)はページ群全体を一度に見て頻度を数えられるが、
+    索引処理は1フレームずつ流れてくるため、直近フレームの統計で近似する。
+
+    記録は同時に1セッションしか動かないため、セッションが変わったら統計は捨てる。
+    """
+
+    def __init__(self, window: int = 300, warmup: int = 20, ratio: float = 0.6):
+        self.window = window  # この件数を超えたらカウントを減衰させる(メモリ抑制)
+        self.warmup = warmup  # これ未満の観測数では判定しない(初期の過剰除去を防ぐ)
+        self.ratio = ratio  # 観測数に対する出現率がこれ以上なら「常時表示」とみなす
+        self._session_id: str | None = None
+        self._counts: Counter[str] = Counter()
+        self._observed = 0
+        self._lock = threading.Lock()
+
+    def observe(self, session_id: str, keys: set[str]) -> set[str]:
+        """1フレーム分の行キーを記録し、「常時表示」と判定した行キーの集合を返す。"""
+        with self._lock:
+            if session_id != self._session_id:
+                self._session_id = session_id
+                self._counts = Counter()
+                self._observed = 0
+            if self._observed >= self.window:
+                self._decay()
+            self._counts.update(keys)
+            self._observed += 1
+            if self._observed < self.warmup:
+                return set()
+            threshold = self._observed * self.ratio
+            return {key for key, count in self._counts.items() if count >= threshold}
+
+    def _decay(self) -> None:
+        """カウントを半減させ、古い情報を薄めつつ出現率の連続性を保つ。
+
+        丸ごとリセットすると判定が毎回ウォームアップからやり直しになるため、
+        半減させて「めったに出ない行」だけを落とす。
+        """
+        for key, count in list(self._counts.items()):
+            halved = count // 2
+            if halved:
+                self._counts[key] = halved
+            else:
+                del self._counts[key]
+        self._observed //= 2
 
 
 class LatestQueue[T]:
@@ -96,6 +147,7 @@ class EventProcessor:
         self.embeddings = embeddings
         self.queue: LatestQueue[ProcessingItem] = LatestQueue(queue_size)
         self.status = ProcessorStatus()
+        self.chrome_tracker = ChromeLineTracker()
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._index_lock = threading.Lock()
@@ -169,7 +221,7 @@ class EventProcessor:
         """保存 + 索引を同期的に行う(テスト・後方互換用)。通常の記録中はstore_oneのみが使われる。"""
         event_id = self.store_one(item)
         try:
-            self._index_event(event_id, item.candidate.frame)
+            self._index_event(event_id, item.candidate.frame, item.session_id)
         except Exception as exc:
             LOGGER.exception("Indexing failed for event %s", event_id)
             self.status.last_error = str(exc)
@@ -178,13 +230,15 @@ class EventProcessor:
 
     def reprocess_one(self, event_id: int) -> int:
         """Retry OCR and embedding generation for an already stored event."""
-        row = self.db.fetchone("SELECT frame_path FROM screen_event WHERE id=?", (event_id,))
+        row = self.db.fetchone(
+            "SELECT frame_path, session_id FROM screen_event WHERE id=?", (event_id,)
+        )
         if not row:
             raise LookupError("Event not found")
         try:
             with self.storage.open_image(row["frame_path"]) as image:
                 frame = to_bgr(image)
-            self._index_event(event_id, frame)
+            self._index_event(event_id, frame, str(row["session_id"]))
         except Exception as exc:
             LOGGER.exception("Reindexing failed for event %s", event_id)
             self.status.last_error = str(exc)
@@ -194,11 +248,37 @@ class EventProcessor:
         self.status.last_processed_at = iso(datetime.now(UTC))
         return event_id
 
-    def _index_event(self, event_id: int, frame: np.ndarray) -> None:
+    def _clean_ocr_text(self, session_id: str, ocr_result: OcrResult, height: int) -> str:
+        """タスクバー等のUIノイズを除いたOCRテキストを組み立てる。
+
+        画面をフル解像度で取り込んでいるため、本文と一緒に常時表示のUI(タスクバー・
+        時計・メニューバー)もOCRされる。これらは全フレームに共通して現れるので、
+        残したまま埋め込みを作るとどのフレーム同士も似た向きのベクトルになり、
+        意味検索で内容の違いを区別しにくくなる。全文検索でも毎回ヒットしてしまう。
+        """
+        # 1つのOcrLineに複数行が入っている場合(改行を含むテキストを返すプロバイダ)も
+        # 行単位で判定できるよう、改行で分割してから扱う
+        lines = [
+            {"text": part, "polygon": line.polygon}
+            for line in ocr_result.lines
+            for part in line.text.splitlines()
+        ]
+        if not lines and ocr_result.text:
+            # 行データを返さないOCRプロバイダでも、本文が空にならないようにする
+            # (座標が無いので位置による判定は効かず、パターン判定のみになる)
+            lines = [{"text": value, "polygon": []} for value in ocr_result.text.splitlines()]
+        repeated = self.chrome_tracker.observe(
+            session_id, {line_key(str(line["text"])) for line in lines}
+        )
+        return "\n".join(clean_ocr_lines(lines, height, repeated))
+
+    def _index_event(self, event_id: int, frame: np.ndarray, session_id: str) -> None:
         # OCRバックエンドは同時呼び出しを保証しないため、録画処理と手動再処理を直列化する。
         with self._index_lock:
             ocr_result = normalize_ocr_result(self.ocr.recognize(frame))
-            vector = self.embeddings.encode_document(ocr_result.text) if ocr_result.text else None
+            clean_text = self._clean_ocr_text(session_id, ocr_result, int(frame.shape[0]))
+            # 埋め込みは洗浄後のテキストから作る(生テキストではない)
+            vector = self.embeddings.encode_document(clean_text) if clean_text else None
         metadata = json.dumps(
             {
                 "provider": self.ocr.name,
@@ -214,11 +294,15 @@ class EventProcessor:
             connection.execute(
                 """
                 UPDATE screen_event SET
-                    ocr_text=?, ocr_confidence=?, embedding=?, embedding_dim=?, processed_at=?
+                    ocr_text=?, ocr_text_clean=?, ocr_confidence=?,
+                    embedding=?, embedding_dim=?, processed_at=?
                 WHERE id=?
                 """,
                 (
+                    # 生テキストは証跡とLIKEでの厳密検索のために残し、
+                    # 全文検索の索引には洗浄後のテキストを使う
                     ocr_result.text,
+                    clean_text,
                     ocr_result.confidence,
                     vector.astype(np.float32).tobytes() if vector is not None else None,
                     int(vector.size) if vector is not None else None,
@@ -334,7 +418,8 @@ class BackgroundIndexer:
 
     def _next_pending(self):
         return self.db.fetchone(
-            "SELECT id, frame_path FROM screen_event WHERE processed_at IS NULL ORDER BY started_at LIMIT 1"
+            "SELECT id, frame_path, session_id FROM screen_event "
+            "WHERE processed_at IS NULL ORDER BY started_at LIMIT 1"
         )
 
     def _refresh_pending_count(self) -> None:
@@ -346,7 +431,7 @@ class BackgroundIndexer:
         try:
             with self.processor.storage.open_image(row["frame_path"]) as image:
                 frame = to_bgr(image)
-            self.processor._index_event(event_id, frame)
+            self.processor._index_event(event_id, frame, str(row["session_id"]))
             self.status.indexed_total += 1
             self.status.last_indexed_at = iso(datetime.now(UTC))
             self._attempts.pop(event_id, None)

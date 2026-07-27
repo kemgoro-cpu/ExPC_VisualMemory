@@ -129,7 +129,9 @@ class SearchEngine:
         value = query.strip()
         if not value:
             return []
-        conditions = ["ocr_text LIKE ? ESCAPE '\\'"]
+        # 3文字未満のトークン用のフォールバック。FTSと同じ洗浄後テキストを対象にする
+        # (生テキストを対象にすると、タスクバー等のノイズが短いクエリで全件ヒットする)
+        conditions = ["ocr_text_clean LIKE ? ESCAPE '\\'"]
         escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         params: list[Any] = [f"%{escaped}%"]
         if start:
@@ -259,7 +261,9 @@ class SearchEngine:
     def _row(row) -> dict[str, Any]:
         data = dict(row)
         data.pop("embedding", None)
-        text = data.get("ocr_text", "")
+        # 抜粋にはタスクバー等のUIノイズを除いた版を使う。まだバックフィルしていない
+        # 古いイベントでは空になりうるため、その場合は生テキストにフォールバックする。
+        text = data.get("ocr_text_clean") or data.get("ocr_text", "")
         data["ocr_excerpt"] = text[:500]
         return data
 

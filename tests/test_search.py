@@ -30,6 +30,24 @@ def test_japanese_substring_search_uses_trigram_with_short_query_fallback(servic
     assert service.search.search("噴射")[0]["id"] == event_id
 
 
+def test_taskbar_noise_does_not_match_full_text_search(service):
+    # 全文検索の索引は洗浄後テキストなので、時計のような常時表示のUIではヒットしない。
+    # 意味検索は常に「近い順」で候補を返す仕様なので、ここでは全文検索の順位
+    # (exact_rank)がつくかどうかで判定する。
+    event_id = add_event(service, "14:32\nECU噴射マップを更新しました", seconds=1)
+
+    assert service.search.search("噴射マップ")[0]["id"] == event_id
+    assert all(row["exact_rank"] is None for row in service.search.search("14:32"))
+
+
+def test_search_excerpt_uses_cleaned_text(service):
+    add_event(service, "14:32\n利益率の推移を確認する", seconds=1)
+
+    result = service.search.search("利益率")[0]
+    assert result["ocr_excerpt"] == "利益率の推移を確認する"
+    assert result["ocr_text"] == "14:32\n利益率の推移を確認する"  # 生テキストは残っている
+
+
 def test_ocr_text_normalization_makes_kana_confusables_searchable(service):
     # OCRが"タ-ミナル"(ASCIIハイフン混入)と誤読しても、正規化後は"ターミナル"として
     # 保存されるため、正しい表記でのクエリでヒットする

@@ -31,7 +31,10 @@ CREATE TABLE IF NOT EXISTS screen_event (
     width INTEGER NOT NULL,
     height INTEGER NOT NULL,
     event_kind TEXT NOT NULL DEFAULT 'stable',
+    -- ocr_text はOCRの生の結果。証跡として残し、LIKEでの厳密検索にも使う。
+    -- ocr_text_clean はタスクバー等のUIノイズを除いた版で、全文検索と埋め込みの入力になる。
     ocr_text TEXT NOT NULL DEFAULT '',
+    ocr_text_clean TEXT NOT NULL DEFAULT '',
     ocr_confidence REAL,
     embedding BLOB,
     embedding_dim INTEGER,
@@ -88,24 +91,57 @@ CREATE TABLE IF NOT EXISTS context_pack_item (
 CREATE INDEX IF NOT EXISTS idx_context_pack_status ON context_pack(status, expires_at);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS screen_event_fts USING fts5(
-    ocr_text,
+    ocr_text_clean,
     content='screen_event',
     content_rowid='id',
     tokenize='trigram case_sensitive 0'
 );
 
 CREATE TRIGGER IF NOT EXISTS screen_event_ai AFTER INSERT ON screen_event BEGIN
-  INSERT INTO screen_event_fts(rowid, ocr_text) VALUES (new.id, new.ocr_text);
+  INSERT INTO screen_event_fts(rowid, ocr_text_clean) VALUES (new.id, new.ocr_text_clean);
 END;
 CREATE TRIGGER IF NOT EXISTS screen_event_ad AFTER DELETE ON screen_event BEGIN
-  INSERT INTO screen_event_fts(screen_event_fts, rowid, ocr_text)
-  VALUES('delete', old.id, old.ocr_text);
+  INSERT INTO screen_event_fts(screen_event_fts, rowid, ocr_text_clean)
+  VALUES('delete', old.id, old.ocr_text_clean);
 END;
-CREATE TRIGGER IF NOT EXISTS screen_event_au AFTER UPDATE OF ocr_text ON screen_event BEGIN
-  INSERT INTO screen_event_fts(screen_event_fts, rowid, ocr_text)
-  VALUES('delete', old.id, old.ocr_text);
-  INSERT INTO screen_event_fts(rowid, ocr_text) VALUES (new.id, new.ocr_text);
+CREATE TRIGGER IF NOT EXISTS screen_event_au AFTER UPDATE OF ocr_text_clean ON screen_event BEGIN
+  INSERT INTO screen_event_fts(screen_event_fts, rowid, ocr_text_clean)
+  VALUES('delete', old.id, old.ocr_text_clean);
+  INSERT INTO screen_event_fts(rowid, ocr_text_clean) VALUES (new.id, new.ocr_text_clean);
 END;
+"""
+
+# FTS5の外部コンテンツ方式(content='screen_event')は、索引する列名が screen_event の
+# 実在する列名と一致している必要がある。そのため既存DBの移行は必ず
+# 「トリガーとFTSを外す → 列を追加して値を充填 → FTSを作り直して rebuild」の順で行う。
+# 先にトリガーを外さないと、充填のUPDATEが古い定義のFTSへ書き込もうとして失敗する。
+_FTS_DROP_SQL = """
+DROP TRIGGER IF EXISTS screen_event_ai;
+DROP TRIGGER IF EXISTS screen_event_ad;
+DROP TRIGGER IF EXISTS screen_event_au;
+DROP TABLE IF EXISTS screen_event_fts;
+"""
+
+_FTS_CREATE_SQL = """
+CREATE VIRTUAL TABLE screen_event_fts USING fts5(
+    ocr_text_clean,
+    content='screen_event',
+    content_rowid='id',
+    tokenize='trigram case_sensitive 0'
+);
+CREATE TRIGGER screen_event_ai AFTER INSERT ON screen_event BEGIN
+  INSERT INTO screen_event_fts(rowid, ocr_text_clean) VALUES (new.id, new.ocr_text_clean);
+END;
+CREATE TRIGGER screen_event_ad AFTER DELETE ON screen_event BEGIN
+  INSERT INTO screen_event_fts(screen_event_fts, rowid, ocr_text_clean)
+  VALUES('delete', old.id, old.ocr_text_clean);
+END;
+CREATE TRIGGER screen_event_au AFTER UPDATE OF ocr_text_clean ON screen_event BEGIN
+  INSERT INTO screen_event_fts(screen_event_fts, rowid, ocr_text_clean)
+  VALUES('delete', old.id, old.ocr_text_clean);
+  INSERT INTO screen_event_fts(rowid, ocr_text_clean) VALUES (new.id, new.ocr_text_clean);
+END;
+INSERT INTO screen_event_fts(screen_event_fts) VALUES('rebuild');
 """
 
 
@@ -138,37 +174,31 @@ class Database:
                 connection.execute("ALTER TABLE context_pack ADD COLUMN artifact_path TEXT")
             if "build_error" not in pack_columns:
                 connection.execute("ALTER TABLE context_pack ADD COLUMN build_error TEXT")
+            event_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(screen_event)").fetchall()
+            }
+            needs_clean_column = "ocr_text_clean" not in event_columns
             fts = connection.execute(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name='screen_event_fts'"
             ).fetchone()
-            if fts and "trigram" not in str(fts["sql"] or "").lower():
-                connection.executescript(
-                    """
-                    DROP TRIGGER IF EXISTS screen_event_ai;
-                    DROP TRIGGER IF EXISTS screen_event_ad;
-                    DROP TRIGGER IF EXISTS screen_event_au;
-                    DROP TABLE screen_event_fts;
-                    CREATE VIRTUAL TABLE screen_event_fts USING fts5(
-                        ocr_text,
-                        content='screen_event',
-                        content_rowid='id',
-                        tokenize='trigram case_sensitive 0'
-                    );
-                    CREATE TRIGGER screen_event_ai AFTER INSERT ON screen_event BEGIN
-                      INSERT INTO screen_event_fts(rowid, ocr_text) VALUES (new.id, new.ocr_text);
-                    END;
-                    CREATE TRIGGER screen_event_ad AFTER DELETE ON screen_event BEGIN
-                      INSERT INTO screen_event_fts(screen_event_fts, rowid, ocr_text)
-                      VALUES('delete', old.id, old.ocr_text);
-                    END;
-                    CREATE TRIGGER screen_event_au AFTER UPDATE OF ocr_text ON screen_event BEGIN
-                      INSERT INTO screen_event_fts(screen_event_fts, rowid, ocr_text)
-                      VALUES('delete', old.id, old.ocr_text);
-                      INSERT INTO screen_event_fts(rowid, ocr_text) VALUES (new.id, new.ocr_text);
-                    END;
-                    INSERT INTO screen_event_fts(screen_event_fts) VALUES('rebuild');
-                    """
-                )
+            fts_sql = str(fts["sql"] or "").lower() if fts else ""
+            # 索引方式(trigram化)と索引対象列(ocr_text_clean化)のどちらの移行も
+            # 「作り直して rebuild」で済むため、1つの分岐にまとめている
+            needs_fts_rebuild = bool(fts) and (
+                "trigram" not in fts_sql or "ocr_text_clean" not in fts_sql
+            )
+            if needs_clean_column or needs_fts_rebuild:
+                connection.executescript(_FTS_DROP_SQL)
+                if needs_clean_column:
+                    connection.execute(
+                        "ALTER TABLE screen_event ADD COLUMN "
+                        "ocr_text_clean TEXT NOT NULL DEFAULT ''"
+                    )
+                    # 既存イベントは暫定的に生テキストをそのまま洗浄済み扱いにする。
+                    # これをしないと、バックフィルを流すまで全イベントが検索から消える。
+                    connection.execute("UPDATE screen_event SET ocr_text_clean = ocr_text")
+                connection.executescript(_FTS_CREATE_SQL)
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

@@ -26,7 +26,14 @@ from .config import Settings
 from .db import Database
 from .imaging import Redaction, apply_redactions, sha256_bytes, sha256_file
 from .stitching import SourceFrame, render_document_pages
-from .textnorm import normalize_ocr_text
+from .textnorm import (
+    FILE_TITLE_PATTERN,
+    TITLE_EXTENSIONS,
+    clean_ocr_lines,
+    line_key,
+    looks_like_chrome_noise,
+    normalize_ocr_line,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -77,70 +84,10 @@ def _display_time(value: str | None) -> str:
         return value
 
 
-_NOISE_LABELS = {
-    "検索", "q 検索", "ファイル", "ホーム", "挿入", "描画", "デザイン",
-    "画面切り替え", "アニメーション", "スライドショー", "record", "校閲",
-    "表示", "ヘルプ", "acrobat", "共有", "日本語", "ノート", "表示設定",
-    "コメント", "アクセシビリティ：検討が必要です",
-    "アクセシビリティ: 検討が必要です",
-}
-_TITLE_EXTENSIONS = (
-    r"pptx?|docx?|xlsx?|pdf|py|ipynb|js|ts|tsx|jsx|java|cs|cpp|c|h"
-    r"|md|txt|ya?ml|json|html?|css"
-)
-_FILE_TITLE = re.compile(rf"(?i)(.+?\.(?:{_TITLE_EXTENSIONS}))")
 # ファイル名らしき部分の直後が日本語の続き(ひらがな・カタカナ・漢字)であれば、
 # 「rendererではNode.jsを無効にし」のような文中の言及であってファイル名の提示では
 # ないと判断する
 _MID_SENTENCE_CONTINUATION = re.compile(r"[ぁ-んァ-ヶー一-龠]")
-
-
-def _normalize_ocr_line(value: str) -> str:
-    return re.sub(r"\s+", " ", normalize_ocr_text(value)).strip()
-
-
-_ACCESS_KEY_ITEM = re.compile(r"([^\s()]+)\(([A-Za-z])\)")
-
-
-def _looks_like_chrome_noise(value: str) -> bool:
-    normalized = _normalize_ocr_line(value)
-    lowered = normalized.casefold()
-    if not normalized or lowered in _NOISE_LABELS:
-        return True
-    if len(normalized) <= 1:
-        return True
-    if re.fullmatch(r"[+×□○●△▽◇◆★☆※*%]+", normalized):
-        return True
-    # メニューバーの「表示(V) 移動(G) 実行(R)…」のようなアクセスキー付き項目が
-    # 1行に複数並ぶ行はメニューバー全体とみなして除去する
-    if len(_ACCESS_KEY_ITEM.findall(normalized)) >= 2:
-        return True
-    # 単独行でも、ラベル部分が既知のノイズ語彙(表示・ヘルプ等)に一致すれば除去する
-    single_access_key = _ACCESS_KEY_ITEM.fullmatch(normalized)
-    if single_access_key and single_access_key.group(1).casefold() in _NOISE_LABELS:
-        return True
-    ui_terms = (
-        "ファイル", "ホーム", "挿入", "描画", "デザイン", "画面切り替え",
-        "アニメーション", "スライドショー", "record", "校閲", "表示", "ヘルプ",
-        "acrobat", "共有", "ノート", "表示設定",
-    )
-    if sum(term in lowered for term in ui_terms) >= 2:
-        return True
-    if _FILE_TITLE.search(normalized) and any(
-        app in lowered for app in ("powerpoint", "word", "excel", "chrome", "edge")
-    ):
-        return True
-    if re.fullmatch(r"\d+[*/]\d+", normalized):
-        return True
-    if re.fullmatch(r"スライド\s*\d+/\d+", normalized):
-        return True
-    if re.fullmatch(r"\d{1,2}:\d{2}(?::\d{2})?", normalized):
-        return True
-    if re.fullmatch(r"\d{4}[/-]\d{1,2}[/-]\d{1,2}", normalized):
-        return True
-    if re.fullmatch(r"\d+(?:\.\d+)?%", normalized):
-        return True
-    return bool(re.fullmatch(r"-?\d+(?:\.\d+)?\s*℃", normalized))
 
 
 def _automatic_title(rows: list[Any]) -> str:
@@ -148,8 +95,8 @@ def _automatic_title(rows: list[Any]) -> str:
     file_titles: list[str] = []
     for row in rows:
         for raw in str(row["ocr_text"] or "").splitlines():
-            line = _normalize_ocr_line(raw)
-            match = _FILE_TITLE.search(line)
+            line = normalize_ocr_line(raw)
+            match = FILE_TITLE_PATTERN.search(line)
             trailing = line[match.end() :] if match else ""
             if match and not _MID_SENTENCE_CONTINUATION.match(trailing):
                 title = re.sub(
@@ -158,13 +105,13 @@ def _automatic_title(rows: list[Any]) -> str:
                     match.group(1),
                 ).strip()
                 title = re.sub(r"(?<=[ァ-ヶ])-+(?=[ァ-ヶ])", "ー", title)
-                title = re.sub(rf"(?i)\.(?:{_TITLE_EXTENSIONS})$", "", title)
+                title = re.sub(rf"(?i)\.(?:{TITLE_EXTENSIONS})$", "", title)
                 # パンくずリストやタブのパス表示(「C: > Users > … > PLAN.md」)から
                 # ファイル名部分だけを取り出す
                 title = re.split(r"\s*(?:>|\\|/)\s*", title)[-1].strip()
                 if title:
                     file_titles.append(title)
-            if 5 <= len(line) <= 100 and not _looks_like_chrome_noise(line):
+            if 5 <= len(line) <= 100 and not looks_like_chrome_noise(line):
                 candidates.append(line)
     if file_titles:
         counts = Counter(file_titles)
@@ -201,12 +148,12 @@ def _safe_ocr_lines(
         return [
             {"text": line, "polygon": []}
             for line in original_text.splitlines()
-            if _normalize_ocr_line(line)
+            if normalize_ocr_line(line)
         ]
 
     safe_lines: list[dict[str, Any]] = []
     for line in metadata_lines:
-        text = _normalize_ocr_line(str(line.get("text", "")))
+        text = normalize_ocr_line(str(line.get("text", "")))
         polygon = line.get("polygon") or []
         if not text:
             continue
@@ -236,38 +183,24 @@ def _safe_ocr_lines(
 def _clean_ocr_items(
     line_groups: list[list[dict[str, Any]]], dimensions: list[tuple[int, int]]
 ) -> list[str]:
+    # ページ群全体で何回出てきた行かを数え、6割以上のページに出る行を
+    # 「常時表示のUI」の候補とする。実際に落とすかは位置も見て決める(clean_ocr_lines)
     document_frequency: Counter[str] = Counter()
     for lines in line_groups:
-        document_frequency.update({_normalize_ocr_line(line["text"]).casefold() for line in lines})
+        document_frequency.update({line_key(line["text"]) for line in lines})
     repeat_threshold = max(2, math.ceil(len(line_groups) * 0.6))
-    results: list[str] = []
-    for lines, (_width, height) in zip(line_groups, dimensions, strict=True):
-        cleaned: list[str] = []
-        seen: set[str] = set()
-        for line in lines:
-            text = _normalize_ocr_line(line["text"])
-            key = text.casefold()
-            if key in seen or _looks_like_chrome_noise(text):
-                continue
-            polygon = line.get("polygon") or []
-            ys = [float(point[1]) for point in polygon if len(point) >= 2]
-            repeated_outer_chrome = False
-            if ys and height > 0 and document_frequency[key] >= repeat_threshold:
-                center_y = (min(ys) + max(ys)) / 2 / height
-                repeated_outer_chrome = center_y <= 0.14 or center_y >= 0.82
-            if repeated_outer_chrome:
-                continue
-            seen.add(key)
-            cleaned.append(text)
-        results.append("\n".join(cleaned))
-    return results
+    repeated_keys = {key for key, count in document_frequency.items() if count >= repeat_threshold}
+    return [
+        "\n".join(clean_ocr_lines(lines, height, repeated_keys))
+        for lines, (_width, height) in zip(line_groups, dimensions, strict=True)
+    ]
 
 
 def _important_ocr(value: str, limit: int = 8) -> list[str]:
     important: list[str] = []
     for raw in value.splitlines():
-        line = _normalize_ocr_line(raw)
-        if not line or _looks_like_chrome_noise(line):
+        line = normalize_ocr_line(raw)
+        if not line or looks_like_chrome_noise(line):
             continue
         if len(line) > 140:
             line = f"{line[:137]}..."

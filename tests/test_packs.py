@@ -40,20 +40,8 @@ def test_external_program_environment_resets_pyinstaller_dll_directory(
     assert dll_directory_calls == [None, str(bundle_root)]
 
 
-def test_looks_like_chrome_noise_detects_combined_menu_bar_line():
-    assert packs_module._looks_like_chrome_noise(
-        "表示(V) 移動(G) 実行(R) ターミナル(T) ヘルプ(H)"
-    )
-
-
-def test_looks_like_chrome_noise_detects_single_known_menu_item():
-    assert packs_module._looks_like_chrome_noise("表示(V)")
-    assert packs_module._looks_like_chrome_noise("ヘルプ(H)")
-
-
-def test_looks_like_chrome_noise_does_not_flag_ordinary_text_with_parens():
-    assert not packs_module._looks_like_chrome_noise("結果(暫定)を確認する")
-    assert not packs_module._looks_like_chrome_noise("四半期の売上高は前年比12.5%増")
+# looks_like_chrome_noise 自体の単体テストは tests/test_textnorm.py にある
+# (判定ロジックは索引処理と共有するため visual_memory.textnorm へ移動した)
 
 
 def test_important_ocr_excludes_menu_bar_lines():
