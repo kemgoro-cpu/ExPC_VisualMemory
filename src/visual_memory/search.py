@@ -59,7 +59,7 @@ class SearchEngine:
         if not query.strip():
             where, params = self._time_clause(start, end)
             rows = self.db.fetchall(
-                f"SELECT * FROM screen_event {where} ORDER BY started_at DESC LIMIT ? OFFSET ?",
+                f"SELECT * FROM screen_event {where} ORDER BY started_at DESC,id DESC LIMIT ? OFFSET ?",
                 [*params, limit, offset],
             )
             return [
@@ -80,7 +80,9 @@ class SearchEngine:
                 scores[event_id].semantic_rank = rank
             else:
                 scores[event_id] = SearchResult(self._row(row), contribution, semantic_rank=rank)
-        ordered = sorted(scores.values(), key=lambda item: (-item.score, item.event["started_at"]))
+        ordered = sorted(
+            scores.values(), key=lambda item: (-item.score, item.event["started_at"], item.event["id"])
+        )
         return [item.to_dict() for item in ordered[offset : offset + limit]]
 
     def timeline_count(self, start: str | None = None, end: str | None = None) -> int:
@@ -91,7 +93,7 @@ class SearchEngine:
     def _exact(self, query: str, start: str | None, end: str | None, limit: int):
         expression = safe_fts_query(query)
         if not expression:
-            return self._like_exact(query, start, end, limit)
+            return self._like_exact_tokens(TOKEN_RE.findall(query)[:32], start, end, limit)
         conditions = ["screen_event_fts MATCH ?"]
         params: list[Any] = [expression]
         if start:
@@ -126,14 +128,19 @@ class SearchEngine:
         return merged[:limit]
 
     def _like_exact(self, query: str, start: str | None, end: str | None, limit: int):
-        value = query.strip()
-        if not value:
+        return self._like_exact_tokens([query.strip()], start, end, limit)
+
+    def _like_exact_tokens(self, tokens: list[str], start: str | None, end: str | None, limit: int):
+        tokens = list(dict.fromkeys(token for token in tokens if token))
+        if not tokens:
             return []
         # 3文字未満のトークン用のフォールバック。FTSと同じ洗浄後テキストを対象にする
         # (生テキストを対象にすると、タスクバー等のノイズが短いクエリで全件ヒットする)
-        conditions = ["ocr_text_clean LIKE ? ESCAPE '\\'"]
-        escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        params: list[Any] = [f"%{escaped}%"]
+        conditions = ["(" + " OR ".join("ocr_text_clean LIKE ? ESCAPE '\\'" for _ in tokens) + ")"]
+        params: list[Any] = [
+            "%" + token.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+            for token in tokens
+        ]
         if start:
             conditions.append("ended_at >= ?")
             params.append(start)
@@ -143,7 +150,7 @@ class SearchEngine:
         params.append(limit)
         return self.db.fetchall(
             f"""SELECT *, 0.0 AS bm25_score FROM screen_event
-                WHERE {" AND ".join(conditions)} ORDER BY started_at DESC LIMIT ?""",
+                WHERE {" AND ".join(conditions)} ORDER BY started_at DESC,id DESC LIMIT ?""",
             params,
         )
 
@@ -155,12 +162,26 @@ class SearchEngine:
         rows, matrix = self._embedding_cache(query_vector.size)
         if matrix is None or not rows:
             return []
+        # Cache only the expensive vectors. Heartbeats update ended_at, and OCR/status can
+        # change without changing the vector count. Read current metadata for filtering.
+        metadata = {
+            int(row["id"]): row
+            for row in self.db.fetchall(
+                "SELECT id,started_at,ended_at FROM screen_event "
+                "WHERE embedding IS NOT NULL AND embedding_dim=?",
+                (query_vector.size,),
+            )
+        }
         scores = matrix @ query_vector
-        eligible = np.ones(len(rows), dtype=bool)
+        eligible = np.asarray([int(row["id"]) in metadata for row in rows]) & np.isfinite(scores)
         if start:
-            eligible &= np.asarray([row["ended_at"] >= start for row in rows])
+            eligible &= np.asarray(
+                [int(row["id"]) in metadata and metadata[int(row["id"])]["ended_at"] >= start for row in rows]
+            )
         if end:
-            eligible &= np.asarray([row["started_at"] <= end for row in rows])
+            eligible &= np.asarray(
+                [int(row["id"]) in metadata and metadata[int(row["id"])]["started_at"] <= end for row in rows]
+            )
         indexes = np.flatnonzero(eligible)
         if indexes.size == 0:
             return []
@@ -170,7 +191,18 @@ class SearchEngine:
             local = np.argpartition(eligible_scores, -count)[-count:]
             indexes = indexes[local]
         indexes = indexes[np.argsort(scores[indexes])[::-1]]
-        return [rows[int(index)] for index in indexes[:limit] if math.isfinite(float(scores[index]))]
+        ids = [
+            int(rows[int(index)]["id"]) for index in indexes[:limit] if math.isfinite(float(scores[index]))
+        ]
+        if not ids:
+            return []
+        current = {
+            int(row["id"]): row
+            for row in self.db.fetchall(
+                f"SELECT * FROM screen_event WHERE id IN ({','.join('?' for _ in ids)})", ids
+            )
+        }
+        return [current[event_id] for event_id in ids if event_id in current]
 
     def _embedding_cache(self, dimension: int) -> tuple[list[Any], np.ndarray | None]:
         signature_row = self.db.fetchone(
@@ -189,7 +221,7 @@ class SearchEngine:
             if can_append:
                 # 前回のmax_id以降に増えた行だけを追加ロードする(録画中の全再構築を避ける)
                 new_rows = self.db.fetchall(
-                    """SELECT * FROM screen_event
+                    """SELECT id,embedding FROM screen_event
                        WHERE embedding IS NOT NULL AND embedding_dim=? AND id > ?
                        ORDER BY id""",
                     (dimension, cached_max_id),
@@ -212,7 +244,8 @@ class SearchEngine:
                 # 途中の行が削除されるなどappendだけで説明できない差分があれば全再構築にフォールバック
 
             raw_rows = self.db.fetchall(
-                "SELECT * FROM screen_event WHERE embedding IS NOT NULL AND embedding_dim=? ORDER BY id",
+                "SELECT id,embedding FROM screen_event "
+                "WHERE embedding IS NOT NULL AND embedding_dim=? ORDER BY id",
                 (dimension,),
             )
             rows, vectors = self._vectorize(raw_rows, dimension)
@@ -241,7 +274,7 @@ class SearchEngine:
             norm = float(np.linalg.norm(vector))
             if not norm:
                 continue
-            rows.append(row)
+            rows.append({"id": int(row["id"])})
             vectors.append(vector / norm)
         return rows, vectors
 
@@ -272,12 +305,13 @@ class SearchEngine:
         if not event:
             return None
         before = self.db.fetchall(
-            "SELECT * FROM screen_event WHERE started_at < ? ORDER BY started_at DESC LIMIT ?",
-            (event["started_at"], count),
+            "SELECT * FROM screen_event WHERE (started_at,id) < (?,?) "
+            "ORDER BY started_at DESC,id DESC LIMIT ?",
+            (event["started_at"], event_id, count),
         )
         after = self.db.fetchall(
-            "SELECT * FROM screen_event WHERE started_at > ? ORDER BY started_at ASC LIMIT ?",
-            (event["started_at"], count),
+            "SELECT * FROM screen_event WHERE (started_at,id) > (?,?) ORDER BY started_at ASC,id ASC LIMIT ?",
+            (event["started_at"], event_id, count),
         )
         return {
             "event": self._row(event),

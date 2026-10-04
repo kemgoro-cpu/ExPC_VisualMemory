@@ -5,7 +5,22 @@ const state = {
   offset: 0, hasMore: false, totalEvents: null, loadingEvents: false, status: null,
   previewTimer: null, lastCandidateCount: null, previewObjectUrl: null,
   statusInFlight: false, previewInFlight: false,
+  showAll: localStorage.getItem("visual-memory-show-all") !== "0",
+  selectedPages: new Set(),
+  searchCriteria: null, searchGeneration: 0, searchController: null,
+  searchLimited: false, candidateLimit: null, statusConnected: false, lastStatusAt: null,
+  pendingNewEvents: 0, manualRequestId: localStorage.getItem("visual-memory-manual-request"), manualInFlight: false,
+  failedPackId: null, failedPackDraft: null, packBuildBusy: false, pagePreviewIndex: 0,
 };
+
+// --- 画面履歴の読み込み量 ---
+//
+// 文書に入れる画面を選ぶときは全体を見渡したいので、既定では全部読み込む。
+// ただし記録が積み上がるとブラウザが固まるため、自動で読む枚数には上限を設ける。
+// APIは1回100件までなので(api.py の limit)、上限に達するまで追加読み込みを繰り返す。
+const COMPACT_PAGE_LIMIT = 60;
+const FULL_PAGE_LIMIT = 100;
+const AUTO_LOAD_CAP = 1000;
 const EVENT_KIND_LABELS = { initial: "初回", motion: "動き", stable: "静止", heartbeat: "定期", manual: "手動" };
 function eventKindLabel(kind) { return EVENT_KIND_LABELS[kind] || kind; }
 const $ = (id) => document.getElementById(id);
@@ -23,8 +38,11 @@ async function api(path, options = {}) {
   const response = await fetch(path, opts);
   if (!response.ok) {
     let message = response.statusText;
-    try { message = (await response.json()).detail || message; } catch {}
-    throw new Error(message);
+    let payload = {};
+    try { payload = await response.json(); message = payload.detail || message; } catch {}
+    const error = new Error(typeof message === "string" ? message : JSON.stringify(message));
+    error.packId = payload.pack_id; error.status = response.status;
+    throw error;
   }
   return response.headers.get("content-type")?.includes("application/json") ? response.json() : response;
 }
@@ -55,7 +73,79 @@ function formatAgo(isoString) {
   return `${Math.floor(minutes / 60)}時間前`;
 }
 function escapeHtml(value = "") { const el = document.createElement("div"); el.textContent = value; return el.innerHTML; }
+function escapeAttribute(value = "") { return escapeHtml(value).replaceAll('"', "&quot;"); }
 function packStatusLabel(status) { return ({approved:"利用可能",expired:"期限切れ",revoked:"共有停止",draft:"未公開"})[status] || status; }
+function ocrStatusLabel(event, includeText = true) {
+  const labels = { pending: "OCR・検索登録待ち", blocked: "OCR利用不可・復旧待ち", retry: "OCR再試行待ち", failed: "OCR処理に失敗", "legacy-unknown": "旧履歴・OCR状態未確認" };
+  if (event.indexing_state && !["indexed", "ready", "complete", "completed", "success"].includes(event.indexing_state)) return labels[event.indexing_state] || `OCR: ${event.indexing_state}`;
+  if (!includeText) return event.indexing_state ? "OCR・検索登録済み" : "OCR状態未確認";
+  return event.ocr_excerpt || event.ocr_text || (event.indexing_state ? "認識済み・文字なし" : "OCR状態未確認・文字なし");
+}
+
+function captureIsRecording(capture) { return ["running", "reconnecting", "starting"].includes(capture?.state); }
+// 詳細画面には「出来上がったページ」を並べる。
+// items は選んだ元画面1件につき1行あるため、そのまま並べると重複をまとめても枚数が減らず、
+// 同じページの絵が何度も出てしまう(153件選ぶと153件並ぶ)。
+// 生成前の文書は pages が空なので、そのときだけ元画面を並べる
+function packPageTiles(pack) {
+  const pages = pack.pages || [];
+  if (!pages.length) {
+    return pack.items.map((item, index) =>
+      `<div class="pack-item"><span class="pack-item-position">${index + 1}</span><button type="button" class="page-preview" data-preview-page="${index}" aria-label="${index + 1}ページ目を拡大"><img src="/api/events/${item.event_id}/frame" alt="${index + 1}ページ目"></button></div>`).join("");
+  }
+  // 選べるのは編集可能な文書で、かつ2ページ以上あるときだけ(最後の1枚は残すため)
+  const selectable = ["draft", "approved"].includes(pack.status) && pages.length > 1;
+  return pages.map(page => {
+    const merged = (page.source_event_ids || []).length;
+    const checked = state.selectedPages.has(page.position);
+    return `<div class="pack-item ${checked ? "selected" : ""}" data-page="${page.position}">`
+      + `<span class="pack-item-position">${page.position + 1}</span>`
+      + `<button type="button" class="page-preview" data-preview-page="${page.position}" aria-label="${page.position + 1}ページ目を拡大"><img src="/api/packs/${pack.id}/pages/${page.position}/image" loading="lazy" alt="${page.position + 1}ページ目"></button>`
+      + (merged > 1 ? `<span class="pack-item-merged">元画面${merged}枚</span>` : "")
+      + (selectable ? `<label class="pack-item-check"><input type="checkbox" data-page-check="${page.position}" ${checked ? "checked" : ""}>削除対象に選択</label>` : "")
+      + `</div>`;
+  }).join("");
+}
+
+// 選んだページの合計枚数(ページ数と、その元になった画面の数)
+function selectedPageTotals(pack) {
+  const pages = (pack.pages || []).filter(page => state.selectedPages.has(page.position));
+  return {
+    pages: pages.length,
+    screens: pages.reduce((total, page) => total + (page.source_event_ids || []).length, 0),
+  };
+}
+
+function renderPackSelection(pack) {
+  const summary = $("packSelectionSummary");
+  const removeButton = $("removeSelectedPages");
+  if (!summary || !removeButton) return;
+  const { pages, screens } = selectedPageTotals(pack);
+  const total = (pack.pages || []).length;
+  // 全部を選ぶと文書が空になるため実行させない。理由を出さないと壊れて見える
+  const wouldEmpty = pages > 0 && pages >= total;
+  summary.textContent = wouldEmpty
+    ? "1ページは残してください"
+    : pages
+      ? `${pages}ページ選択中（元画面${screens}枚ぶん）`
+      : "削除するページを選んでください";
+  summary.classList.toggle("warning", wouldEmpty);
+  removeButton.disabled = pages === 0 || wouldEmpty;
+  $("clearPackSelection").disabled = pages === 0;
+  document.querySelectorAll("[data-page]").forEach(tile => {
+    tile.classList.toggle("selected", state.selectedPages.has(Number(tile.dataset.page)));
+  });
+}
+
+// 選んだ画面の枚数と、重複をまとめたあとのページ数は別物。
+// 枚数だけを出していると重複除去が効いていないように見えるため、両方を並べる
+function packSizeLabel(pack) {
+  const originalCount = pack.item_count ?? pack.image_count ?? pack.items?.length ?? 0;
+  const pageCount = pack.page_count || pack.pages?.length || 0;
+  if (!pageCount) return `元画面 ${originalCount}枚`;
+  const folded = originalCount - pageCount;
+  return `元画面 ${originalCount}枚 → ${pageCount}ページ${folded > 0 ? `（${folded}枚を統合）` : ""}`;
+}
 
 function syncCaptureControls() {
   const status = state.status; if (!status) return;
@@ -64,12 +154,17 @@ function syncCaptureControls() {
   const checkingStorage = ["pending", "scanning"].includes(status.storage.state);
   const stopped = ["stopped", "failed"].includes(capture.state);
   const recording = ["running", "reconnecting", "starting"].includes(capture.state);
-  $("startCapture").disabled = !stopped || loadingModels || checkingStorage || !$("deviceSelect").value;
-  $("stopCapture").disabled = stopped;
-  $("deviceSelect").disabled = !stopped;
-  $("refreshDevices").disabled = !stopped;
-  $("regionSettings").disabled = !stopped;
-  $("manualCapture").disabled = !recording;
+  const previewing = isPreviewing();
+  $("startCapture").disabled = !state.statusConnected || !stopped || loadingModels || checkingStorage || !$("deviceSelect").value;
+  $("stopCapture").disabled = !state.statusConnected || stopped;
+  // プレビュー中はデバイスを掴んでいるので、入力の切り替えや差分領域の変更はできない
+  $("deviceSelect").disabled = !stopped || previewing;
+  $("refreshDevices").disabled = !stopped || previewing;
+  $("regionSettings").disabled = !stopped || previewing;
+  $("manualCapture").disabled = !state.statusConnected || state.manualInFlight || (!recording && !state.manualRequestId);
+  // 記録中はプレビューが自動で出るため、ボタンは不要
+  $("previewToggle").disabled = !state.statusConnected || recording || !$("deviceSelect").value;
+  $("previewToggle").textContent = previewing ? "プレビューを止める" : "プレビュー";
 }
 
 async function refreshStatus() {
@@ -78,23 +173,29 @@ async function refreshStatus() {
   if (state.statusInFlight) return;
   state.statusInFlight = true;
   try {
-    const status = await api("/api/status"); const capture = status.capture;
+    const status = await api("/api/status", { signal: AbortSignal.timeout(12000) }); const capture = status.capture;
+    const previousCapture = state.status?.capture;
+    const wasRecording = captureIsRecording(previousCapture);
+    state.statusConnected = true; state.lastStatusAt = new Date().toISOString();
     const badge = $("captureBadge"); badge.className = `status-badge ${capture.state}`;
-    badge.innerHTML = `<span></span>${({running:"記録中", reconnecting:"再接続中", starting:"開始中", stopped:"停止中"})[capture.state] || capture.state}`;
+    badge.innerHTML = `<span></span>${({running:"記録中", reconnecting:"再接続中", starting:"開始中", stopped:"停止中", failed:"記録失敗"})[capture.state] || escapeHtml(capture.state)}`;
     const recording = ["running", "reconnecting", "starting"].includes(capture.state);
     const indexer = status.indexer || { state: "idle", pending_count: 0 };
     const metrics = [
-      `<div class="metric"><strong>${status.processor.processed}</strong><span>処理イベント</span></div>`,
+      `<div class="metric"><strong>${status.processor.saved_count ?? capture.saved_count ?? 0}</strong><span>保存済み画面（起動後）</span></div>`,
       `<div class="metric"><strong>${indexer.pending_count}</strong><span>索引待ち</span></div>`,
       `<div class="metric"><strong>${formatBytes(status.storage.used_bytes)}</strong><span>ローカル保存</span></div>`,
       `<div class="metric"><strong>${formatBytes(status.storage.disk_free_bytes)}</strong><span>空き容量</span></div>`,
+      `<div class="metric"><strong>${formatBytes(status.storage.history_bytes || 0)}</strong><span>通常の履歴</span></div>`,
+      `<div class="metric"><strong>${formatBytes(status.storage.document_bytes || 0)}</strong><span>長期保存の文書</span></div>`,
+      `<div class="metric"><strong>${formatBytes(status.storage.retained_source_bytes || 0)}</strong><span>文書の元画像 (${Number(status.storage.retained_event_count || 0)}枚)</span></div>`,
     ];
     if (recording && capture.session_started_at) {
       const elapsedSeconds = (Date.now() - new Date(capture.session_started_at).getTime()) / 1000;
       metrics.push(`<div class="metric"><strong>${formatDuration(elapsedSeconds)}</strong><span>記録経過</span></div>`);
-      metrics.push(`<div class="metric"><strong>${capture.candidates_emitted}</strong><span>保存枚数</span></div>`);
-      if (capture.last_candidate_at) {
-        metrics.push(`<div class="metric"><strong>${formatAgo(capture.last_candidate_at)}</strong><span>最終保存 (${eventKindLabel(capture.last_candidate_kind)})</span></div>`);
+      metrics.push(`<div class="metric"><strong>${capture.session_saved_count ?? capture.saved_count ?? "—"}</strong><span>今回の保存完了枚数</span></div>`);
+      if (capture.last_saved_at && capture.last_saved_session_id === capture.session_id) {
+        metrics.push(`<div class="metric"><strong>${formatAgo(capture.last_saved_at)}</strong><span>最終保存 (${eventKindLabel(capture.last_saved_kind)})</span></div>`);
       }
     }
     $("metrics").innerHTML = metrics.join("");
@@ -109,23 +210,46 @@ async function refreshStatus() {
     } else if (indexer.state === "indexing") {
       warnings.push(`文字認識・検索登録を処理中です。残り${indexer.pending_count}枚。`);
     }
+    if (indexer.state === "blocked-ocr" || indexer.blocked_count > 0) warnings.push(`OCR利用不可のため${indexer.blocked_count || indexer.pending_count}枚の検索登録が保留中です。画像は保存済みです。`);
+    if (indexer.state === "retry-wait") warnings.push("OCRの再試行を待っています。画像は保存済みです。");
+    if (indexer.failed_count > 0) warnings.push(`OCR処理に失敗した画面が${indexer.failed_count}枚あります。各画面の詳細から再処理できます。`);
     if (status.ocr.fallback_reason) {
       warnings.push(`GPU OCRの起動に失敗したためCPUで動作中です。索引が遅くなります: ${status.ocr.fallback_reason}`);
     }
     if (indexer.last_error) warnings.push(`索引処理: ${indexer.last_error}`);
     if (status.processor.last_error) warnings.push(`保存処理: ${status.processor.last_error}`);
     if (capture.last_error) warnings.push(`キャプチャー: ${capture.last_error}`);
+    if (status.processor.queue_drops > 0) warnings.push(`処理待ちの上限により${status.processor.queue_drops}件の候補を保存できませんでした。`);
     $("systemWarnings").innerHTML = warnings.map(value => `<div class="warning">${escapeHtml(value)}</div>`).join("");
+    const previousSaved = Number(previousCapture?.saved_count || 0);
+    if (previousCapture && capture.saved_count > previousSaved) {
+      state.pendingNewEvents += capture.saved_count - previousSaved;
+      updateHistoryButton(); triggerCaptureFeedback();
+    }
     state.status = status; syncCaptureControls();
     updatePreviewVisibility(recording);
-  } catch (error) { console.error(error); }
+    if (wasRecording && !recording) refreshHistory();
+  } catch (error) {
+    state.statusConnected = false;
+    const badge = $("captureBadge"); badge.className = "status-badge disconnected";
+    badge.textContent = "接続を確認できません";
+    $("systemWarnings").textContent = `サーバーに接続できません。${state.lastStatusAt ? `最終確認 ${formatTime(state.lastStatusAt)}。` : ""}現在の記録状態は不明です。接続が戻ると自動更新します。`;
+    syncCaptureControls(); stopPreviewPolling();
+  }
   finally { state.statusInFlight = false; }
 }
 
 function updatePreviewVisibility(recording) {
+  // 記録中は自動でプレビューを出す。記録していなくても、プレビューボタンで
+  // 映像だけ確認している間は同じパネルを使い回す
+  const previewing = isPreviewing();
+  const visible = recording || previewing || Boolean(state.manualRequestId);
   const panel = $("previewPanel");
-  panel.hidden = !recording;
-  if (recording) {
+  panel.hidden = !visible;
+  // プレビュー中は何も保存されないため、手動キャプチャは押せると誤解を招く
+  $("manualCapture").hidden = !recording && !state.manualRequestId;
+  document.querySelector(".preview-frame").hidden = !recording && !previewing;
+  if (recording || previewing) {
     if (!state.previewTimer && !document.hidden) {
       refreshPreview();
       state.previewTimer = setInterval(refreshPreview, 1000);
@@ -134,6 +258,10 @@ function updatePreviewVisibility(recording) {
     stopPreviewPolling();
     state.lastCandidateCount = null;
   }
+}
+
+function isPreviewing() {
+  return ["starting", "running"].includes(state.status?.capture?.preview_state);
 }
 
 function stopPreviewPolling() {
@@ -149,17 +277,22 @@ async function refreshPreview() {
   try {
     const response = await fetch("/api/capture/preview", { cache: "no-store" });
     if (!response.ok) return;
-    const count = Number(response.headers.get("X-Candidate-Count") || "0");
     const blob = await response.blob();
     const url = URL.createObjectURL(blob);
     const previous = state.previewObjectUrl;
     $("previewImage").src = url;
     state.previewObjectUrl = url;
     if (previous) URL.revokeObjectURL(previous);
-    if (state.lastCandidateCount !== null && count > state.lastCandidateCount) triggerCaptureFeedback();
-    state.lastCandidateCount = count;
-    const lastCandidateAt = state.status?.capture?.last_candidate_at;
-    if (lastCandidateAt) $("previewCaption").textContent = `最終保存 ${formatAgo(lastCandidateAt)}`;
+    if (isPreviewing()) {
+      // 自動で消えることが分からないと、突然表示が終わった理由が伝わらない
+      const left = state.status?.capture?.preview_seconds_left;
+      const remaining = typeof left === "number" ? `・残り${left}秒` : "";
+      $("previewCaption").textContent = `プレビュー中（保存されません）${remaining}`;
+      return;
+    }
+    const capture = state.status?.capture;
+    const lastSavedAt = capture?.last_saved_session_id === capture?.session_id ? capture?.last_saved_at : null;
+    $("previewCaption").textContent = lastSavedAt ? `最終保存 ${formatAgo(lastSavedAt)}` : "記録中・保存完了待ち";
   } catch (error) { /* プレビュー取得の一時的な失敗は次のポーリングで回復するため無視する */ }
   finally { state.previewInFlight = false; }
 }
@@ -182,33 +315,107 @@ async function loadDevices() {
   } catch (error) { toast(error.message, true); } finally { button.disabled = false; syncCaptureControls(); }
 }
 
-async function searchEvents(append = false) {
-  if (state.loadingEvents) return;
-  const query = $("searchQuery").value.trim(); state.query = query;
-  if (!append) { state.offset = 0; state.hasMore = false; }
-  const params = new URLSearchParams({ q: query, limit: "60", offset: String(state.offset) });
-  if ($("searchStart").value) params.set("start", new Date($("searchStart").value).toISOString());
-  if ($("searchEnd").value) params.set("end", new Date($("searchEnd").value).toISOString());
+function readSearchCriteria() {
+  return {
+    query: $("searchQuery").value.trim(),
+    start: $("searchStart").value ? new Date($("searchStart").value).toISOString() : "",
+    end: $("searchEnd").value ? new Date($("searchEnd").value).toISOString() : "",
+  };
+}
+
+async function loadEventPage(append, generation, criteria, signal) {
+  const pageLimit = state.showAll ? FULL_PAGE_LIMIT : COMPACT_PAGE_LIMIT;
+  const params = new URLSearchParams({ q: criteria.query, limit: String(pageLimit), offset: String(append ? state.offset : 0) });
+  if (criteria.start) params.set("start", criteria.start);
+  if (criteria.end) params.set("end", criteria.end);
+  const data = await api(`/api/events?${params}`, { signal });
+  if (generation !== state.searchGeneration || signal.aborted) return false;
+  if (append) {
+    const known = new Set(state.events.map(event => event.id));
+    state.events.push(...data.events.filter(event => !known.has(event.id)));
+    (data.sessions || []).forEach(session => state.sessions.set(session.id, session));
+  } else {
+    state.events = data.events;
+    state.sessions = new Map((data.sessions || []).map(session => [session.id, session]));
+  }
+  state.query = criteria.query;
+  state.searchLimited = Boolean(data.search_limited); state.candidateLimit = data.candidate_limit || null;
+  state.offset = data.next_offset; state.hasMore = data.has_more; state.totalEvents = data.total;
+  const orderedSessions = [...new Set(state.events.map(event => event.session_id))];
+  orderedSessions.forEach((sessionId, index) => {
+    if (!state.knownSessions.has(sessionId) && index > 0) state.collapsedSessions.add(sessionId);
+    state.knownSessions.add(sessionId);
+  });
+  renderEvents();
+  return true;
+}
+
+function finishEventLoading(generation) {
+  if (generation !== state.searchGeneration) return;
+  state.loadingEvents = false; $("loadMore").disabled = false; $("loadMore").hidden = !state.hasMore;
+}
+
+async function searchEvents(options = {}) {
+  let criteria;
+  try { criteria = options.criteria || readSearchCriteria(); }
+  catch { toast("日時を確認してください。", true); return false; }
+  const generation = ++state.searchGeneration;
+  state.searchController?.abort();
+  const controller = new AbortController(); state.searchController = controller;
+  state.searchCriteria = { ...criteria }; state.offset = 0; state.hasMore = false;
   state.loadingEvents = true; $("loadMore").disabled = true;
   try {
-    const data = await api(`/api/events?${params}`);
-    if (append) {
-      const known = new Set(state.events.map(event => event.id));
-      state.events.push(...data.events.filter(event => !known.has(event.id)));
-      (data.sessions || []).forEach(session => state.sessions.set(session.id, session));
-    } else {
-      state.events = data.events;
-      state.sessions = new Map((data.sessions || []).map(session => [session.id, session]));
+    if (!await loadEventPage(false, generation, criteria, controller.signal)) return false;
+    while (state.showAll && state.hasMore && state.events.length < AUTO_LOAD_CAP && generation === state.searchGeneration) {
+      const before = state.events.length;
+      if (!await loadEventPage(true, generation, criteria, controller.signal) || state.events.length === before) break;
     }
-    state.offset = data.next_offset; state.hasMore = data.has_more; state.totalEvents = data.total;
-    const orderedSessions = [...new Set(state.events.map(event => event.session_id))];
-    orderedSessions.forEach((sessionId, index) => {
-      if (!state.knownSessions.has(sessionId) && index > 0) state.collapsedSessions.add(sessionId);
-      state.knownSessions.add(sessionId);
-    });
-    renderEvents();
-  } catch (error) { toast(error.message, true); }
-  finally { state.loadingEvents = false; $("loadMore").disabled = false; $("loadMore").hidden = !state.hasMore; }
+    return generation === state.searchGeneration;
+  } catch (error) {
+    if (generation === state.searchGeneration && error.name !== "AbortError") toast(error.message, true);
+    return false;
+  } finally { finishEventLoading(generation); }
+}
+
+async function loadEvents(append = false) {
+  if (!append) return searchEvents();
+  if (state.loadingEvents || !state.hasMore) return false;
+  const generation = state.searchGeneration;
+  state.loadingEvents = true; $("loadMore").disabled = true;
+  try { return await loadEventPage(true, generation, state.searchCriteria, state.searchController.signal); }
+  catch (error) { if (generation === state.searchGeneration && error.name !== "AbortError") toast(error.message, true); return false; }
+  finally { finishEventLoading(generation); }
+}
+
+function updateHistoryButton() {
+  $("refreshHistory").textContent = state.pendingNewEvents ? `新しい画面 ${state.pendingNewEvents}件を表示` : "履歴を更新";
+}
+
+async function refreshHistory() {
+  const scrollX = window.scrollX, scrollY = window.scrollY;
+  const criteria = state.searchCriteria || readSearchCriteria();
+  const refreshed = await searchEvents({ criteria });
+  if (refreshed) {
+    state.pendingNewEvents = 0; updateHistoryButton();
+    window.scrollTo(scrollX, scrollY);
+  }
+  return refreshed;
+}
+
+function setShowAll(value) {
+  state.showAll = value;
+  localStorage.setItem("visual-memory-show-all", value ? "1" : "0");
+  syncDensityButton();
+  searchEvents();
+}
+
+function syncDensityButton() {
+  const button = $("toggleDensity");
+  if (!button) return;
+  button.textContent = state.showAll ? "表示を絞る" : "すべて表示";
+  button.title = state.showAll
+    ? `${COMPACT_PAGE_LIMIT}枚だけ表示に切り替えます`
+    : `最大${AUTO_LOAD_CAP}枚まで読み込みます`;
 }
 
 function eventGroups() {
@@ -221,20 +428,25 @@ function eventGroups() {
     .map(([sessionId, events]) => ({
       sessionId,
       session: state.sessions.get(sessionId) || {},
-      events: events.sort((a, b) => new Date(a.started_at) - new Date(b.started_at)),
+      events: events.sort((a, b) => new Date(a.started_at) - new Date(b.started_at) || a.id - b.id),
     }))
     .sort((a, b) => new Date(b.session.started_at || b.events[0].started_at) - new Date(a.session.started_at || a.events[0].started_at));
 }
 
 function renderEvents() {
+  const focus = captureEventFocus();
   const countLabel = state.totalEvents == null ? `${state.events.length}${state.hasMore ? "+" : ""}` : `${state.events.length} / ${state.totalEvents}`;
-  $("resultsMeta").textContent = `${countLabel} 件${state.query ? ` · 「${state.query}」` : " · 新しい順"}`;
+  // 上限で打ち切ったときは、なぜ止まったのかが分からないと「壊れている」と見えるため明示する
+  const capped = state.showAll && state.hasMore && state.events.length >= AUTO_LOAD_CAP;
+  const capNote = capped ? `（表示の上限${AUTO_LOAD_CAP}枚に達しました。「さらに読み込む」で続きを表示します）` : "";
+  $("resultsMeta").textContent = `${countLabel} 件${state.query ? ` · 「${state.query}」` : " · 新しい順"}${capNote}`;
+  $("searchNotice").textContent = state.searchLimited ? `検索は文字検索・意味検索それぞれ上位${state.candidateLimit || 200}候補から表示します。全一致件数ではありません。期間を絞ると候補を探しやすくなります。` : "";
   $("eventGrid").innerHTML = eventGroups().map(({sessionId, session, events}) => {
     const collapsed = state.collapsedSessions.has(sessionId);
     const selectedCount = events.filter(event => state.selected.has(event.id)).length;
     const allSelected = selectedCount === events.length;
     const total = Number(session.event_count || events.length);
-    const selectLabel = allSelected ? "全解除" : (state.query ? `一致した${events.length}枚を全選択` : "全選択");
+    const selectLabel = allSelected ? `表示中の${events.length}枚を解除` : `表示中の${events.length}枚を選択`;
     const started = session.started_at || events[0].started_at;
     const ended = session.ended_at || events.at(-1).ended_at;
     return `<section class="recording-session" data-session="${sessionId}">
@@ -247,7 +459,7 @@ function renderEvents() {
       ${collapsed ? "" : `<div class="session-event-grid" data-lasso-session="${sessionId}">
         ${events.map(event => `<article class="event-card ${state.selected.has(event.id) ? "selected" : ""}" data-event-id="${event.id}" tabindex="0" role="checkbox" aria-checked="${state.selected.has(event.id)}" aria-label="${formatTime(event.started_at)}の場面を選択">
           <div class="event-image"><img draggable="false" loading="lazy" src="/api/events/${event.id}/frame?thumbnail=true" alt=""><span class="selection-mark">✓</span><span class="event-score">${eventKindLabel(event.event_kind)}${event.score ? ` · ${(event.score * 1000).toFixed(1)}` : ""}</span></div>
-          <div class="event-body"><div class="event-time">${formatTime(event.started_at)}</div><div class="event-text">${escapeHtml(event.ocr_excerpt || "OCR待ち、または文字なし")}</div>
+          <div class="event-body"><div class="event-time">${formatTime(event.started_at)}</div><div class="event-text" title="${escapeAttribute(event.indexing_error || "")}">${escapeHtml(ocrStatusLabel(event))}</div>
           <div class="event-actions"><label class="check-label"><input type="checkbox" data-select="${event.id}" ${state.selected.has(event.id) ? "checked" : ""}>選択</label><button class="ghost" data-detail="${event.id}">詳細</button></div></div>
         </article>`).join("")}
       </div>`}
@@ -268,6 +480,24 @@ function renderEvents() {
     renderEvents();
   }));
   document.querySelectorAll("[data-lasso-session]").forEach(setupLassoSelection);
+  restoreEventFocus(focus);
+}
+
+function captureEventFocus() {
+  const active = document.activeElement;
+  const card = active?.closest?.("[data-event-id]");
+  if (card) return { id: card.dataset.eventId, action: active.dataset.select ? "select" : active.dataset.detail ? "detail" : "card" };
+  if (active?.dataset.selectSession) return { session: active.dataset.selectSession, action: "selectSession" };
+  if (active?.dataset.toggleSession) return { session: active.dataset.toggleSession, action: "toggleSession" };
+  return null;
+}
+
+function restoreEventFocus(focus) {
+  if (!focus) return;
+  const selector = focus.session
+    ? `[data-${focus.action === "selectSession" ? "select-session" : "toggle-session"}="${CSS.escape(focus.session)}"]`
+    : focus.action === "card" ? `[data-event-id="${focus.id}"]` : `[data-${focus.action}="${focus.id}"]`;
+  document.querySelector(selector)?.focus({ preventScroll: true });
 }
 
 function addEventsToSelection(events) {
@@ -287,7 +517,7 @@ function toggleSelected(id, checked, range = false) {
     const events = eventGroups().find(group => group.sessionId === event.session_id)?.events || [];
     const from = events.findIndex(item => item.id === state.lastSelected.id);
     const to = events.findIndex(item => item.id === id);
-    const selection = events.slice(Math.min(from, to), Math.max(from, to) + 1);
+    const selection = from < 0 || to < 0 ? [event] : events.slice(Math.min(from, to), Math.max(from, to) + 1);
     if (checked) addEventsToSelection(selection); else selection.forEach(item => state.selected.delete(item.id));
   } else if (checked) addEventsToSelection([event]); else state.selected.delete(id);
   state.lastSelected = {id, sessionId: event.session_id};
@@ -392,13 +622,13 @@ function reorderBasket(sourceId, targetId) {
 async function showDetail(id) {
   try {
     const data = await api(`/api/events/${id}`); const event = data.event;
-    $("detailContent").innerHTML = `<p class="eyebrow">EVENT ${event.id}</p><h2>${formatTime(event.started_at)}</h2><img class="detail-image" src="/api/events/${event.id}/frame"><pre class="ocr-box">${escapeHtml(event.ocr_text || "OCRテキストなし")}</pre><div class="dialog-actions"><button class="ghost" data-reindex-event="${event.id}">OCR・検索を再処理</button></div>`;
+    $("detailContent").innerHTML = `<p class="eyebrow">EVENT ${event.id}</p><h2>${formatTime(event.started_at)}</h2><p class="muted">${escapeHtml(ocrStatusLabel(event, false))}</p>${event.indexing_error ? `<p class="build-error">${escapeHtml(event.indexing_error)}</p>` : ""}<img class="detail-image" src="/api/events/${event.id}/frame" alt="保存した画面"><pre class="ocr-box">${escapeHtml(event.ocr_text || "OCRテキストなし")}</pre><div class="dialog-actions"><button class="ghost" data-reindex-event="${event.id}">OCR・検索を再処理</button></div>`;
     document.querySelector("[data-reindex-event]").addEventListener("click", async buttonEvent => {
       const button = buttonEvent.currentTarget; button.disabled = true; button.textContent = "再処理中…";
       try {
         await api(`/api/events/${event.id}/reindex`, {method:"POST"});
         toast("OCR・検索インデックスを再処理しました。");
-        await showDetail(event.id); await searchEvents();
+        await showDetail(event.id); await refreshHistory();
       } catch (error) { toast(error.message, true); button.disabled = false; button.textContent = "OCR・検索を再処理"; }
     });
     if (!$("detailDialog").open) $("detailDialog").showModal();
@@ -406,40 +636,175 @@ async function showDetail(id) {
 }
 
 async function createPack() {
-  if (!state.selected.size) return toast("場面を1枚以上選択してください。", true);
-  if (state.selected.size > warningDocumentImages && !window.confirm(`${state.selected.size}枚を1つの文書にまとめます。ファイルが大きくなる可能性があります。続けますか？`)) return;
-  const button = $("createPack"); const label = button.textContent; button.disabled = true; button.textContent = "文書を作成中…";
+  if (state.packBuildBusy) return;
+  if (!state.failedPackId && !state.selected.size) return toast("場面を1枚以上選択してください。", true);
+  if (!state.failedPackId && state.selected.size > warningDocumentImages && !window.confirm(`${state.selected.size}枚を1つの文書にまとめます。ファイルが大きくなる可能性があります。続けますか？`)) return;
+  const draft = state.failedPackDraft || { title: $("packTitle").value, note: $("packNote").value, query: state.query, event_ids: [...state.selected.keys()] };
+  const options = { deduplicate_overlaps: $("deduplicateOverlaps").checked, include_appendix: $("includeAppendix").checked };
+  const button = $("createPack"); state.packBuildBusy = true; button.disabled = true; button.textContent = "文書を作成中…";
+  $("startNewPack").disabled = true;
+  $("createPackStatus").textContent = "HTML文書を作成しています。PDFは作成後に生成できます。";
   try {
-    await api("/api/packs", { method: "POST", body: { title: $("packTitle").value, note: $("packNote").value, query: state.query, event_ids: [...state.selected.keys()], deduplicate_overlaps: $("deduplicateOverlaps").checked } });
-    state.selected.clear(); renderBasket(); renderEvents(); $("packTitle").value = ""; $("packNote").value = "";
-    toast("コンテキスト文書を作成しました。PDF・HTML・MCPですぐ利用できます。"); await showPacks();
-  } catch (error) { toast(error.message, true); }
-  finally { button.disabled = false; button.textContent = label; }
+    if (state.failedPackId) await api(`/api/packs/${state.failedPackId}/rebuild`, { method: "POST", body: options });
+    else await api("/api/packs", { method: "POST", body: { ...draft, ...options } });
+    draft.event_ids.forEach(id => state.selected.delete(id)); renderBasket(); renderEvents();
+    if ($("packTitle").value === draft.title) $("packTitle").value = "";
+    if ($("packNote").value === draft.note) $("packNote").value = "";
+    state.failedPackId = null; state.failedPackDraft = null;
+    $("createPackStatus").textContent = "HTML文書を作成し、MCP共有を開始しました。PDFは文書を開いて生成してください。";
+    toast("文書を作成しました。"); await showPacks();
+  } catch (error) {
+    if (error.packId) { state.failedPackId = error.packId; state.failedPackDraft = draft; }
+    $("createPackStatus").textContent = `${error.message}${state.failedPackId ? " 前回の画面・順序・タイトルを保持しました。同じ文書を再生成できます。" : ""}`;
+    toast(error.message, true);
+  } finally {
+    state.packBuildBusy = false; button.disabled = false;
+    button.textContent = state.failedPackId ? "失敗した文書を再生成" : "コンテキスト文書を作成";
+    $("startNewPack").hidden = !state.failedPackId;
+    $("startNewPack").disabled = false;
+  }
 }
 
 async function showPacks() {
   try {
     const { packs } = await api("/api/packs");
-    $("packList").innerHTML = packs.map(pack => `<article class="pack-card"><div class="pack-card-head"><div><span class="pack-status">${packStatusLabel(pack.status)}</span><h3>${escapeHtml(pack.title)}</h3><p class="muted">${pack.item_count}枚 · 重複除去 ${pack.deduplicate_overlaps ? "ON" : "OFF"} · ${formatTime(pack.created_at)}${pack.expires_at ? ` · MCP期限 ${formatTime(pack.expires_at)}` : ""}</p>${pack.build_error ? `<p class="build-error">生成に失敗しました: ${escapeHtml(pack.build_error)}</p>` : ""}</div><button class="ghost" data-open-pack="${pack.id}">開く</button></div></article>`).join("") || `<p class="muted">まだ文書はありません。</p>`;
+    $("packList").innerHTML = packs.map(pack => `<article class="pack-card"><div class="pack-card-head"><div><span class="pack-status">${packStatusLabel(pack.status)}</span><h3>${escapeHtml(pack.title)}</h3><p class="muted">${packSizeLabel(pack)} · 重複除去 ${pack.deduplicate_overlaps ? "ON" : "OFF"} · PDF ${pack.include_appendix ? "OCR全文あり" : "画像＋OCR抜粋"} · ${formatTime(pack.created_at)}${pack.expires_at ? ` · MCP期限 ${formatTime(pack.expires_at)}` : ""} · ローカルに長期保存</p>${pack.build_error ? `<p class="build-error">生成に失敗しました: ${escapeHtml(pack.build_error)}</p>` : ""}</div><button class="ghost" data-open-pack="${pack.id}">開く</button></div></article>`).join("") || `<p class="muted">まだ文書はありません。</p>`;
     document.querySelectorAll("[data-open-pack]").forEach(button => button.addEventListener("click", () => openPack(button.dataset.openPack)));
-    $("packsDialog").showModal();
+    if (!$("packsDialog").open) $("packsDialog").showModal();
   } catch (error) { toast(error.message, true); }
 }
 
 async function openPack(id) {
   try {
     const pack = await api(`/api/packs/${id}`); state.activePack = pack;
-    const exportActions = pack.status === "draft" ? `<div><p class="muted">この文書は未公開です。${pack.build_error ? `生成エラー: ${escapeHtml(pack.build_error)} 再生成すると復旧できます。` : "再生成が完了していません。"}</p><button class="primary" data-rebuild-pack="${id}">文書を再生成</button></div>` : `<a href="/api/packs/${id}/document?format=pdf"><button class="primary">PDF文書</button></a><a href="/api/packs/${id}/document?format=html"><button class="ghost">単一HTML</button></a>`;
-    const actions = `${exportActions}${pack.status === "approved" ? `<button class="danger" data-revoke="${id}">MCP共有を停止</button>` : ""}`;
-    $("packList").innerHTML = `<button class="ghost" id="backToPacks">← 一覧</button><article class="pack-card"><span class="pack-status">${packStatusLabel(pack.status)}</span><h3>${escapeHtml(pack.title)}</h3><p class="muted">${escapeHtml(pack.note)}</p><div class="pack-items">${pack.items.map((item, index) => `<div class="pack-item"><span class="pack-item-position">${index + 1}</span><img src="/api/events/${item.event_id}/frame"></div>`).join("")}</div><div class="dialog-actions">${actions}</div></article>`;
+    state.selectedPages = new Set();
+    const exportActions = pack.status === "draft" ? `<p class="muted">この文書は未公開です。${pack.build_error ? `生成エラー: ${escapeHtml(pack.build_error)}` : "生成が完了していません。"}</p>` : `<button type="button" class="primary" id="downloadPdf">PDFを生成・保存</button><a class="button-link ghost" href="/api/packs/${id}/document?format=html" target="_blank" rel="noopener">単一HTMLを開く</a>`;
+    const actions = `${exportActions}${pack.status === "approved" ? `<button class="danger" data-revoke="${id}">MCP共有を停止</button>` : ""}<button class="danger" id="deleteDocument" type="button">文書を削除…</button>`;
+    // 作り直しは重いので、消したいページをまとめて選んでから1回で実行する
+    const selectable = ["draft", "approved"].includes(pack.status) && (pack.pages || []).length > 1;
+    const selectionBar = selectable ? `<div class="pack-items-toolbar">
+      <span id="packSelectionSummary" class="pack-selection-summary"></span>
+      <button class="ghost" id="clearPackSelection" type="button">選択解除</button>
+      <button class="danger" id="removeSelectedPages" type="button">選択したページを削除</button>
+    </div>` : "";
+    const editable = ["draft", "approved", "expired", "revoked"].includes(pack.status);
+    const rebuildOptions = editable ? `<fieldset class="pack-options"><legend>同じ元画面・順序で再作成</legend><label class="option-check"><input id="rebuildDeduplicate" type="checkbox" ${pack.deduplicate_overlaps ? "checked" : ""}>連続画面の重複を除去</label><label class="option-check"><input id="rebuildAppendix" type="checkbox" ${pack.include_appendix ? "checked" : ""}>PDFにOCR全文を含める（付録を追加）</label><p class="muted">OFFは画像＋OCR抜粋、ONは認識済みの本文全文を収録します。再作成すると現在の文書を置き換えます。</p><button class="ghost" data-rebuild-pack="${id}" type="button">この設定で文書を再生成</button><p id="rebuildStatus" role="status"></p></fieldset>` : "";
+    $("packList").innerHTML = `<button class="ghost" id="backToPacks">← 一覧</button><article class="pack-card"><span class="pack-status">${packStatusLabel(pack.status)}</span><h3>${escapeHtml(pack.title)}</h3><p class="muted">${escapeHtml(pack.note)}</p><p class="muted">${packSizeLabel(pack)} · PDF ${pack.include_appendix ? "OCR全文あり" : "画像＋OCR抜粋"}${pack.expires_at ? ` · MCP期限 ${formatTime(pack.expires_at)}` : ""} · ローカルに長期保存</p><p class="muted">画像を押すと拡大します。${selectable ? "削除対象はチェック欄で選択してください。" : ""}</p>${selectionBar}<div class="pack-items">${packPageTiles(pack)}</div>${rebuildOptions}<div class="dialog-actions">${actions}</div><p id="pdfStatus" role="status"></p></article>`;
     $("backToPacks").onclick = showPacks;
     document.querySelector("[data-revoke]")?.addEventListener("click", async () => { try { await api(`/api/packs/${id}/revoke`, {method:"POST"}); toast("MCP共有を停止しました。"); openPack(id); } catch(error) { toast(error.message,true); } });
     document.querySelector("[data-rebuild-pack]")?.addEventListener("click", async event => {
       const button = event.currentTarget; button.disabled = true; button.textContent = "再生成中…";
-      try { await api(`/api/packs/${id}/approve`, {method:"POST"}); toast("文書を再生成しました。"); openPack(id); }
-      catch(error) { toast(error.message,true); button.disabled = false; button.textContent = "文書を再生成"; }
+      const message = $("rebuildStatus"); message.textContent = "文書を再生成しています。元画面と順序は保持されます。";
+      try {
+        await api(`/api/packs/${id}/rebuild`, {method:"POST",body:{deduplicate_overlaps:$("rebuildDeduplicate").checked,include_appendix:$("rebuildAppendix").checked}});
+        clearFailedPack(id); toast("文書を再生成しました。"); await openPack(id);
+      } catch(error) { message.textContent = `再生成に失敗しました: ${error.message}`; button.disabled = false; button.textContent = "同じ文書で再試行"; }
     });
+    $("downloadPdf")?.addEventListener("click", () => downloadPdf(pack));
+    $("deleteDocument").addEventListener("click", () => previewPackDeletion(pack));
+    document.querySelectorAll("[data-page-check]").forEach(input => input.addEventListener("change", () => {
+      togglePackPage(Number(input.dataset.pageCheck), input.checked);
+    }));
+    document.querySelectorAll("[data-preview-page]").forEach(button => button.addEventListener("click", () => openPagePreview(Number(button.dataset.previewPage))));
+    $("clearPackSelection")?.addEventListener("click", () => {
+      state.selectedPages.clear();
+      document.querySelectorAll("[data-page-check]").forEach(input => { input.checked = false; });
+      renderPackSelection(pack);
+    });
+    $("removeSelectedPages")?.addEventListener("click", () => removeSelectedPages(id, pack));
+    renderPackSelection(pack);
+    if (!$("packsDialog").open) $("packsDialog").showModal();
   } catch (error) { toast(error.message, true); }
+}
+
+function clearFailedPack(id) {
+  if (state.failedPackId !== id) return;
+  state.failedPackId = null; state.failedPackDraft = null;
+  $("createPack").textContent = "コンテキスト文書を作成"; $("createPackStatus").textContent = "";
+  $("startNewPack").hidden = true;
+}
+
+function startNewPack() {
+  if (state.packBuildBusy) return;
+  clearFailedPack(state.failedPackId);
+  $("createPackStatus").textContent = "失敗した文書はコンテキスト文書一覧に残っています。現在の候補から別の文書を作成できます。";
+}
+
+function openPagePreview(position) {
+  const pack = state.activePack; if (!pack) return;
+  const pages = pack.pages?.length ? pack.pages : pack.items.map((item, index) => ({position:index, event_id:item.event_id}));
+  const index = pages.findIndex(page => page.position === position); if (index < 0) return;
+  state.pagePreviewIndex = index;
+  $("pagePreviewTitle").textContent = `${pack.title} · ${index + 1} / ${pages.length}ページ`;
+  $("pagePreviewImage").src = pack.pages?.length ? `/api/packs/${pack.id}/pages/${position}/image` : `/api/events/${pages[index].event_id}/frame`;
+  $("previousPage").disabled = index === 0; $("nextPage").disabled = index === pages.length - 1;
+  $("previousPage").onclick = () => openPagePreview(pages[index - 1].position);
+  $("nextPage").onclick = () => openPagePreview(pages[index + 1].position);
+  if (!$("pagePreviewDialog").open) $("pagePreviewDialog").showModal();
+}
+
+async function downloadPdf(pack) {
+  const button = $("downloadPdf"), status = $("pdfStatus");
+  if (button.disabled) return;
+  button.disabled = true; button.textContent = "PDFを生成中…";
+  status.textContent = "PDFを生成・取得しています。枚数によって1〜2分かかることがあります。";
+  try {
+    const response = await api(`/api/packs/${pack.id}/document?format=pdf`);
+    const blob = await response.blob(); const url = URL.createObjectURL(blob);
+    const link = document.createElement("a"); link.href = url; link.download = `${pack.title.replace(/[<>:"/\\|?*]/g, "_") || "context"}.pdf`;
+    document.body.appendChild(link); link.click(); link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+    status.textContent = "PDFの生成が完了し、ダウンロードを開始しました。"; button.textContent = "PDFをもう一度保存";
+  } catch (error) {
+    status.textContent = `PDFの生成に失敗しました: ${error.message}。この文書で再試行できます。`;
+    button.textContent = "PDF生成を再試行";
+  } finally { button.disabled = false; }
+}
+
+async function previewPackDeletion(pack) {
+  try {
+    const preview = await api(`/api/packs/${pack.id}/deletion-preview`);
+    $("deletePackSummary").textContent = `「${preview.title}」を削除します。削除する文書容量: ${formatBytes(preview.document_bytes)}。元画像${preview.source_count}枚を残します（うち${preview.shared_source_count}枚は他の文書でも使用）。`;
+    $("deletePackStatus").textContent = "";
+    const button = $("confirmDeletePack"); button.disabled = false; button.textContent = "この文書を削除する";
+    button.onclick = async () => {
+      button.disabled = true; button.textContent = "削除中…";
+      try {
+        await api(`/api/packs/${pack.id}?confirm=true`, {method:"DELETE"});
+        clearFailedPack(pack.id); state.activePack = null;
+        $("deletePackDialog").close(); toast("文書を削除しました。元画像は残しています。");
+        await showPacks(); await refreshStatus();
+      } catch (error) { $("deletePackStatus").textContent = error.message; button.disabled = false; button.textContent = "削除を再試行"; }
+    };
+    if (!$("deletePackDialog").open) $("deletePackDialog").showModal();
+  } catch (error) { toast(error.message, true); }
+}
+
+function togglePackPage(position, selected) {
+  if (selected) state.selectedPages.add(position); else state.selectedPages.delete(position);
+  if (state.activePack) renderPackSelection(state.activePack);
+}
+
+// 選んだページをまとめて外す。作り直しは重い(実測で153枚の文書に75秒)ので、
+// 何回かに分けず1回のリクエストにまとめる
+async function removeSelectedPages(id, pack) {
+  const positions = [...state.selectedPages].sort((a, b) => a - b);
+  if (!positions.length) return;
+  const { screens } = selectedPageTotals(pack);
+  if (!window.confirm(`${positions.length}ページ（元画面${screens}枚ぶん）を文書から外します。画面履歴には残ります。\n文書を作り直すため、1〜2分かかることがあります。よろしいですか？`)) return;
+  const button = $("removeSelectedPages");
+  const controls = [button, $("clearPackSelection"), ...document.querySelectorAll("[data-page-check]")];
+  controls.forEach(control => { control.disabled = true; });
+  button.textContent = "削除中…";
+  try {
+    await api(`/api/packs/${id}/pages`, { method: "DELETE", body: { positions } });
+    toast(`${positions.length}ページを文書から外しました。`);
+    await openPack(id);
+  } catch (error) {
+    toast(error.message, true);
+    controls.forEach(control => { control.disabled = false; });
+    button.textContent = "選択したページを削除";
+  }
 }
 
 async function openRegionEditor() {
@@ -479,21 +844,61 @@ function regionPoint(event) {
   return { x: (event.clientX - box.left) / box.width, y: (event.clientY - box.top) / box.height };
 }
 
+async function submitManualCapture() {
+  if (state.manualInFlight) return;
+  const button = $("manualCapture");
+  state.manualRequestId ||= crypto.randomUUID();
+  const requestId = state.manualRequestId;
+  localStorage.setItem("visual-memory-manual-request", requestId);
+  state.manualInFlight = true; button.textContent = "保存結果を確認中…"; syncCaptureControls();
+  try {
+    let result = await api("/api/capture/manual", {method:"POST",body:{request_id:requestId}});
+    const deadline = Date.now() + 120000;
+    while (result.state === "pending" && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      result = await api(`/api/capture/manual/${requestId}`, {signal:AbortSignal.timeout(12000)});
+    }
+    if (result.state === "pending") {
+      toast("保存処理を待っています。同じ要求の結果を引き続き確認できます。");
+      return;
+    }
+    state.manualRequestId = null; localStorage.removeItem("visual-memory-manual-request");
+    if (result.state !== "saved") throw new Error(result.error || "手動キャプチャを保存できませんでした。");
+    triggerCaptureFeedback(); toast(`手動キャプチャを保存しました（画面 ${result.event_id}）。`);
+    await refreshStatus(); await refreshHistory();
+  } catch (error) {
+    // 結果が未確認なら同じIDを保つ。通信断後の再試行で二重保存しない。
+    if ([404, 409, 422].includes(error.status)) { state.manualRequestId = null; localStorage.removeItem("visual-memory-manual-request"); }
+    toast(`${error.message}${state.manualRequestId ? " 保存結果を再確認してください。" : ""}`, true);
+  } finally {
+    state.manualInFlight = false; button.textContent = state.manualRequestId ? "保存結果を再確認" : "今すぐキャプチャ"; syncCaptureControls();
+  }
+}
+
 document.addEventListener("DOMContentLoaded", () => {
-  $("refreshDevices").onclick = loadDevices; $("regionSettings").onclick = openRegionEditor; $("startCapture").onclick = async () => { const source_name = $("deviceSelect").value; if (!source_name) return toast("デバイスを選択してください。", true); try { await api("/api/capture/start", {method:"POST",body:{source_name}}); toast("記録を開始しました。"); refreshStatus(); } catch(error) { toast(error.message,true); } };
-  $("stopCapture").onclick = async () => { try { await api("/api/capture/stop", {method:"POST"}); toast("記録を停止しました。"); refreshStatus(); } catch(error) { toast(error.message,true); } };
-  $("manualCapture").onclick = async () => {
-    const button = $("manualCapture"); const label = button.textContent;
-    button.disabled = true; button.textContent = "キャプチャ中…";
+  $("refreshDevices").onclick = loadDevices; $("regionSettings").onclick = openRegionEditor; $("startCapture").onclick = async () => { const source_name = $("deviceSelect").value; if (!source_name) return toast("デバイスを選択してください。", true); $("startCapture").disabled = true; try { await api("/api/capture/start", {method:"POST",body:{source_name}}); toast("記録を開始しました。"); await refreshStatus(); } catch(error) { toast(error.message,true); } finally { syncCaptureControls(); } };
+  $("stopCapture").onclick = async () => { $("stopCapture").disabled = true; try { await api("/api/capture/stop", {method:"POST"}); toast("記録を停止しました。"); await refreshStatus(); } catch(error) { toast(error.message,true); } finally { syncCaptureControls(); } };
+  $("manualCapture").onclick = submitManualCapture;
+  $("manualCapture").textContent = state.manualRequestId ? "保存結果を再確認" : "今すぐキャプチャ";
+  $("previewToggle").onclick = async () => {
+    const button = $("previewToggle");
+    const stopping = isPreviewing();
+    const source_name = $("deviceSelect").value;
+    if (!stopping && !source_name) return toast("デバイスを選択してください。", true);
+    button.disabled = true;
     try {
-      await api("/api/capture/manual", {method:"POST"});
-      triggerCaptureFeedback();
-      toast("手動キャプチャを保存しました。");
+      if (stopping) await api("/api/capture/preview/stop", {method:"POST"});
+      else await api("/api/capture/preview/start", {method:"POST", body:{source_name}});
+      await refreshStatus();
     } catch (error) { toast(error.message, true); }
-    finally { button.textContent = label; syncCaptureControls(); }
+    finally { syncCaptureControls(); }
   };
   $("searchForm").onsubmit = event => { event.preventDefault(); searchEvents(); }; $("createPack").onclick = createPack; $("showPacks").onclick = showPacks;
-  $("loadMore").onclick = () => searchEvents(true);
+  $("startNewPack").onclick = startNewPack;
+  // 上限を超えて続きを見る操作なので、ここは1回ぶんだけ読む
+  $("loadMore").onclick = () => loadEvents(true);
+  $("refreshHistory").onclick = refreshHistory;
+  $("toggleDensity").onclick = () => setShowAll(!state.showAll);
   $("deviceSelect").onchange = () => { if ($("deviceSelect").value) localStorage.setItem("visual-memory-device", $("deviceSelect").value); syncCaptureControls(); };
   $("sortChronological").onclick = () => setSelectionOrder([...state.selected.values()].sort((a,b) => new Date(a.started_at) - new Date(b.started_at)));
   $("reverseOrder").onclick = () => setSelectionOrder([...state.selected.values()].reverse());
@@ -505,6 +910,7 @@ document.addEventListener("DOMContentLoaded", () => {
   $("clearIgnoreRegions").onclick = () => { if(state.regionEditor){state.regionEditor.ignore=[];drawRegions();} };
   $("clearWatchRegions").onclick = () => { if(state.regionEditor){state.regionEditor.watch=[];drawRegions();} };
   $("saveRegions").onclick = async () => { try { const editor=state.regionEditor;await api("/api/capture/regions",{method:"PUT",body:{ignore_regions:editor.ignore,watch_regions:editor.watch}});$("regionDialog").close();toast("差分検出領域を保存しました。"); } catch(error){toast(error.message,true);} };
+  syncDensityButton();
   renderBasket(); loadDevices(); searchEvents(); refreshStatus();
   // タブが非表示の間はポーリングを止め、無駄なリクエストを避ける
   let statusInterval = setInterval(refreshStatus, 5000);

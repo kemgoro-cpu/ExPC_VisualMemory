@@ -54,6 +54,32 @@ def test_api_requires_auth_and_csrf(settings, service):
         )
 
 
+def test_pack_pages_can_be_deleted_together_through_the_api(settings, service):
+    app = create_app(settings, service)
+    with TestClient(app) as client:
+        event_ids = [add_event(service, f"slide {index}", seconds=index) for index in range(4)]
+        pack = service.packs.create("Deletable", event_ids)
+        response = client.get(f"/?token={settings.auth_token}", follow_redirects=False)
+        client.cookies.update(response.cookies)
+        headers = {"X-CSRF-Token": settings.csrf_token}
+
+        # httpx の delete() は json= を受け取らないため request() を使う
+        def remove(positions):
+            return client.request(
+                "DELETE",
+                f"/api/packs/{pack['id']}/pages",
+                json={"positions": positions},
+                headers=headers,
+            )
+
+        deleted = remove([0, 1])
+        assert deleted.status_code == 200
+        assert deleted.json()["page_count"] == pack["page_count"] - 2
+
+        assert remove([99]).status_code == 400
+        assert remove([]).status_code == 400
+
+
 def test_created_pack_is_immediately_available(settings, service):
     event_id = add_event(service, "available")
     pack = service.packs.create("available", [event_id])
@@ -108,6 +134,8 @@ def test_status_reports_background_indexer_state(settings, service):
             "failures",
             "last_error",
             "last_indexed_at",
+            "failed_count",
+            "blocked_count",
         }
 
 
@@ -129,11 +157,78 @@ def test_capture_preview_and_manual_require_running_capture(settings, service):
         client.cookies.update(response.cookies)
         assert client.get("/api/capture/preview").status_code == 409
         assert (
-            client.post(
-                "/api/capture/manual", headers={"X-CSRF-Token": settings.csrf_token}
-            ).status_code
+            client.post("/api/capture/manual", headers={"X-CSRF-Token": settings.csrf_token}).status_code
             == 409
         )
+
+
+def test_manual_capture_returns_pending_then_durable_saved_id(settings, service, monkeypatch):
+    headers = {"X-Visual-Memory-Token": settings.auth_token, "X-CSRF-Token": settings.csrf_token}
+    app = create_app(settings, service)
+    request_id = "retryable-request"
+    result = {"request_id": request_id, "state": "pending", "event_id": None, "error": None}
+
+    def request(*, request_id):
+        assert request_id == result["request_id"]
+        return dict(result)
+
+    monkeypatch.setattr(service.capture, "request_manual_capture", request)
+    monkeypatch.setattr(service.capture, "manual_capture_status", lambda _id: dict(result))
+    with TestClient(app) as client:
+        response = client.post("/api/capture/manual", json={"request_id": request_id}, headers=headers)
+        assert response.json()["state"] == "pending"
+        event_id = add_event(service, "manual evidence")
+        result.update(state="saved", event_id=event_id)
+        assert client.get(f"/api/capture/manual/{request_id}", headers=headers).json()["event_id"] == event_id
+        assert (
+            client.post("/api/capture/manual", json={"request_id": request_id}, headers=headers).json()[
+                "state"
+            ]
+            == "saved"
+        )
+        assert service.search.timeline_count() == 1
+
+
+def test_document_rebuild_delete_and_search_metadata(settings, service):
+    headers = {"X-Visual-Memory-Token": settings.auth_token, "X-CSRF-Token": settings.csrf_token}
+    with TestClient(create_app(settings, service)) as client:
+        event_id = add_event(service, "保存する本文")
+        created = client.post(
+            "/api/packs", headers=headers, json={"title": "keep", "event_ids": [event_id]}
+        ).json()
+        path = f"/api/packs/{created['id']}"
+        client.post(path + "/revoke", headers=headers)
+        rebuilt = client.post(
+            path + "/rebuild", headers=headers, json={"deduplicate_overlaps": False, "include_appendix": True}
+        )
+        assert rebuilt.status_code == 200
+        assert rebuilt.json()["status"] == "revoked"
+        assert rebuilt.json()["include_appendix"] == 1
+        preview = client.get(path + "/deletion-preview", headers=headers).json()
+        assert preview["source_count"] == 1
+        assert preview["document_bytes"] > 0
+        assert client.delete(path, headers=headers).status_code == 400
+        assert client.delete(path + "?confirm=true", headers=headers).json()["deleted"] is True
+        assert client.get(f"/api/events/{event_id}/frame", headers=headers).status_code == 200
+        search = client.get("/api/events?q=保存", headers=headers).json()
+        assert search["search_limited"] is True
+        assert search["candidate_limit"] == 200
+        assert search["total"] is None
+
+
+def test_failed_create_returns_reusable_draft_id(settings, service, monkeypatch):
+    from visual_memory.packs import PackError
+
+    headers = {"X-Visual-Memory-Token": settings.auth_token, "X-CSRF-Token": settings.csrf_token}
+
+    def failed(*args, **kwargs):
+        raise PackError("failed build", pack_id="draft-123")
+
+    monkeypatch.setattr(service.packs, "create", failed)
+    with TestClient(create_app(settings, service)) as client:
+        response = client.post("/api/packs", json={"event_ids": [1]}, headers=headers)
+    assert response.status_code == 400
+    assert response.json() == {"detail": "failed build", "pack_id": "draft-123"}
 
 
 def test_event_history_supports_incremental_paging(settings, service):
@@ -152,9 +247,7 @@ def test_event_history_supports_incremental_paging(settings, service):
     assert first["total"] == 65
     assert len(second["events"]) == 25
     assert second["has_more"] is False
-    assert {item["id"] for item in first["events"]}.isdisjoint(
-        item["id"] for item in second["events"]
-    )
+    assert {item["id"] for item in first["events"]}.isdisjoint(item["id"] for item in second["events"])
 
 
 def test_query_token_is_only_accepted_on_root(settings, service):
@@ -201,9 +294,12 @@ def test_event_can_be_reindexed_after_initial_ocr_failure(monkeypatch, settings,
         response = client.get(f"/?token={settings.auth_token}", follow_redirects=False)
         client.cookies.update(response.cookies)
         event_id = add_event(service, "discarded after failure")
-        assert service.db.fetchone("SELECT processed_at FROM screen_event WHERE id=?", (event_id,))[
-            "processed_at"
-        ] is None
+        assert (
+            service.db.fetchone("SELECT processed_at FROM screen_event WHERE id=?", (event_id,))[
+                "processed_at"
+            ]
+            is None
+        )
 
         service.processor.ocr.texts.clear()
         service.processor.ocr.texts.append("recovered OCR text")
@@ -232,9 +328,10 @@ def test_reindex_does_not_erase_ocr_when_provider_is_unavailable(monkeypatch, se
         )
 
     assert response.status_code == 409
-    assert service.db.fetchone("SELECT ocr_text FROM screen_event WHERE id=?", (event_id,))[
-        "ocr_text"
-    ] == "keep existing OCR"
+    assert (
+        service.db.fetchone("SELECT ocr_text FROM screen_event WHERE id=?", (event_id,))["ocr_text"]
+        == "keep existing OCR"
+    )
 
 
 def test_ui_exposes_recovery_and_keyboard_controls(settings, service):

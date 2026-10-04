@@ -13,6 +13,8 @@ from typing import Any, Protocol
 
 import numpy as np
 
+from .reading_order import polygon_box, sort_in_reading_order
+
 LOGGER = logging.getLogger(__name__)
 
 
@@ -28,6 +30,22 @@ class OcrResult:
     text: str
     confidence: float | None
     lines: list[OcrLine]
+
+
+def order_ocr_result(result: OcrResult) -> OcrResult:
+    """OCR結果の行を読む順に並べ替え、本文もその順で組み直す。
+
+    OCRエンジンごとに行の返し方が違い、いずれも段組みを考慮しない。どのエンジンを
+    使っても同じ順序になるよう、認識直後にここを通す(:mod:`visual_memory.reading_order`)。
+    """
+    ordered = sort_in_reading_order(result.lines, lambda line: polygon_box(line.polygon))
+    if ordered == result.lines:
+        return result
+    return OcrResult(
+        text="\n".join(line.text for line in ordered if line.text.strip()),
+        confidence=result.confidence,
+        lines=ordered,
+    )
 
 
 class OcrProvider(Protocol):

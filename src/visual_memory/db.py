@@ -40,7 +40,16 @@ CREATE TABLE IF NOT EXISTS screen_event (
     embedding_dim INTEGER,
     previous_event_id INTEGER REFERENCES screen_event(id) ON DELETE SET NULL,
     created_at TEXT NOT NULL,
-    processed_at TEXT
+    processed_at TEXT,
+    captured_at TEXT,
+    manual_request_id TEXT,
+    indexing_state TEXT NOT NULL DEFAULT 'pending',
+    indexing_error TEXT,
+    index_attempts INTEGER NOT NULL DEFAULT 0,
+    index_retry_at TEXT,
+    retained INTEGER NOT NULL DEFAULT 0,
+    frame_bytes INTEGER NOT NULL DEFAULT 0,
+    thumbnail_bytes INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_screen_event_time ON screen_event(started_at DESC);
@@ -66,6 +75,7 @@ CREATE TABLE IF NOT EXISTS context_pack (
     query TEXT NOT NULL DEFAULT '',
     note TEXT NOT NULL DEFAULT '',
     deduplicate_overlaps INTEGER NOT NULL DEFAULT 0,
+    include_appendix INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL CHECK(status IN ('draft', 'approved', 'revoked', 'expired')),
     approved_at TEXT,
     expires_at TEXT,
@@ -73,6 +83,9 @@ CREATE TABLE IF NOT EXISTS context_pack (
     manifest_sha256 TEXT,
     artifact_path TEXT,
     build_error TEXT,
+    page_count INTEGER,
+    build_token TEXT,
+    build_started_at TEXT,
     created_at TEXT NOT NULL
 );
 
@@ -161,23 +174,74 @@ class Database:
         with closing(self.connect()) as connection, connection:
             connection.executescript(SCHEMA)
             pack_columns = {
-                str(row["name"])
-                for row in connection.execute("PRAGMA table_info(context_pack)").fetchall()
+                str(row["name"]) for row in connection.execute("PRAGMA table_info(context_pack)").fetchall()
             }
             if "deduplicate_overlaps" not in pack_columns:
                 # Existing documents retain their original one-frame-per-page behavior.
                 connection.execute(
-                    "ALTER TABLE context_pack ADD COLUMN "
-                    "deduplicate_overlaps INTEGER NOT NULL DEFAULT 0"
+                    "ALTER TABLE context_pack ADD COLUMN deduplicate_overlaps INTEGER NOT NULL DEFAULT 0"
+                )
+            if "include_appendix" not in pack_columns:
+                # 付録(OCR全文)は文書の半分以上を占めることがあるため、既定では付けない。
+                # 既存の文書も再生成時は付録なしに揃える
+                connection.execute(
+                    "ALTER TABLE context_pack ADD COLUMN include_appendix INTEGER NOT NULL DEFAULT 0"
                 )
             if "artifact_path" not in pack_columns:
                 connection.execute("ALTER TABLE context_pack ADD COLUMN artifact_path TEXT")
             if "build_error" not in pack_columns:
                 connection.execute("ALTER TABLE context_pack ADD COLUMN build_error TEXT")
+            if "page_count" not in pack_columns:
+                # 重複をまとめた結果、実際に何ページになったか。選んだ画面の枚数とは別物で、
+                # これが無いと利用者からは重複除去が効いているか分からない。
+                # 既存の文書は次の再生成で入る(それまではNULL)
+                connection.execute("ALTER TABLE context_pack ADD COLUMN page_count INTEGER")
             event_columns = {
-                str(row["name"])
-                for row in connection.execute("PRAGMA table_info(screen_event)").fetchall()
+                str(row["name"]) for row in connection.execute("PRAGMA table_info(screen_event)").fetchall()
             }
+            for name in ("build_token", "build_started_at"):
+                if name not in pack_columns:
+                    connection.execute(f"ALTER TABLE context_pack ADD COLUMN {name} TEXT")
+            event_additions = {
+                "captured_at": "TEXT",
+                "manual_request_id": "TEXT",
+                "indexing_state": "TEXT NOT NULL DEFAULT 'pending'",
+                "indexing_error": "TEXT",
+                "index_attempts": "INTEGER NOT NULL DEFAULT 0",
+                "index_retry_at": "TEXT",
+                "retained": "INTEGER NOT NULL DEFAULT 0",
+                "frame_bytes": "INTEGER NOT NULL DEFAULT 0",
+                "thumbnail_bytes": "INTEGER NOT NULL DEFAULT 0",
+            }
+            for name, declaration in event_additions.items():
+                if name not in event_columns:
+                    connection.execute(f"ALTER TABLE screen_event ADD COLUMN {name} {declaration}")
+            if "indexing_state" not in event_columns:
+                # Empty legacy OCR is not proof that OCR ran successfully. Retain uncertainty
+                # unless the evidence identifies a real provider, and never blanket requeue it.
+                connection.execute("""
+                    WITH latest AS (
+                        SELECT e.id, (SELECT CASE WHEN json_valid(v.metadata_json)
+                            THEN json_extract(v.metadata_json,'$.provider') END
+                            FROM evidence v WHERE v.event_id=e.id AND v.kind='ocr'
+                            ORDER BY v.id DESC LIMIT 1) AS provider FROM screen_event e
+                    )
+                    UPDATE screen_event SET indexing_state=CASE
+                        WHEN processed_at IS NULL THEN 'pending'
+                        WHEN (SELECT provider FROM latest WHERE latest.id=screen_event.id)='disabled'
+                            THEN 'blocked'
+                        WHEN ocr_text != '' OR
+                            (SELECT provider FROM latest WHERE latest.id=screen_event.id) IS NOT NULL
+                            THEN 'ready'
+                        ELSE 'legacy-unknown' END
+                """)
+            if "retained" not in event_columns:
+                connection.execute("""UPDATE screen_event SET retained=1
+                    WHERE id IN (SELECT event_id FROM context_pack_item)""")
+            connection.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_manual_request
+                ON screen_event(manual_request_id) WHERE manual_request_id IS NOT NULL""")
+            connection.execute("""CREATE INDEX IF NOT EXISTS idx_event_indexing
+                ON screen_event(indexing_state,index_retry_at,id)""")
             needs_clean_column = "ocr_text_clean" not in event_columns
             fts = connection.execute(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name='screen_event_fts'"
@@ -185,15 +249,12 @@ class Database:
             fts_sql = str(fts["sql"] or "").lower() if fts else ""
             # 索引方式(trigram化)と索引対象列(ocr_text_clean化)のどちらの移行も
             # 「作り直して rebuild」で済むため、1つの分岐にまとめている
-            needs_fts_rebuild = bool(fts) and (
-                "trigram" not in fts_sql or "ocr_text_clean" not in fts_sql
-            )
+            needs_fts_rebuild = bool(fts) and ("trigram" not in fts_sql or "ocr_text_clean" not in fts_sql)
             if needs_clean_column or needs_fts_rebuild:
                 connection.executescript(_FTS_DROP_SQL)
                 if needs_clean_column:
                     connection.execute(
-                        "ALTER TABLE screen_event ADD COLUMN "
-                        "ocr_text_clean TEXT NOT NULL DEFAULT ''"
+                        "ALTER TABLE screen_event ADD COLUMN ocr_text_clean TEXT NOT NULL DEFAULT ''"
                     )
                     # 既存イベントは暫定的に生テキストをそのまま洗浄済み扱いにする。
                     # これをしないと、バックフィルを流すまで全イベントが検索から消える。

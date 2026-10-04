@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 from pathlib import Path
 
 import numpy as np
@@ -60,6 +61,23 @@ def service(settings: Settings) -> VisualMemoryService:
     return VisualMemoryService(settings, ocr=QueueOcr(), embeddings=HashEmbedding())
 
 
+_frame_counter = itertools.count()
+
+
+def distinct_frame(color: int = 0) -> np.ndarray:
+    """呼び出しごとに絵柄が変わるテスト用フレームを作る。
+
+    無地のフレームを続けて渡すと、記録時の重複スキップ(EventProcessor._duplicate_event_id)が
+    「同じ画面」とみなして2枚目以降を保存しない。イベントが増える前提のテストが成立しなく
+    なるため、呼び出し回数を左上に縞模様として描き込んで区別できるようにする。
+    """
+    frame = np.full((36, 64, 3), color, dtype=np.uint8)
+    marker = next(_frame_counter)
+    for bit in range(8):
+        frame[0:8, bit * 8 : bit * 8 + 8] = 255 if (marker >> bit) & 1 else 0
+    return frame
+
+
 def add_event(service: VisualMemoryService, text: str, seconds: int = 0, color: int = 30) -> int:
     from datetime import UTC, datetime, timedelta
 
@@ -72,7 +90,7 @@ def add_event(service: VisualMemoryService, text: str, seconds: int = 0, color: 
     service.ocr.texts.append(text)
     stamp = datetime(2026, 1, 1, tzinfo=UTC) + timedelta(seconds=seconds)
     candidate = FrameCandidate(
-        frame=np.full((36, 64, 3), color, dtype=np.uint8),
+        frame=distinct_frame(color),
         started_at=stamp,
         ended_at=stamp,
         change_score=0.5,

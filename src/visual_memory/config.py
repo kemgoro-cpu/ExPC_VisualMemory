@@ -69,6 +69,10 @@ class Settings:
     motion_checkpoint_seconds: float = 5.0
     change_threshold: float = 0.007
     watch_change_threshold: float = 0.003
+    # 直前に保存した画面とこれだけしか変わっていなければ「同じ画面」とみなして保存しない。
+    # マウスカーソルの移動やホバー効果は変化検出(change_threshold)には引っ掛かるが、
+    # 内容としては同じ画面なので、保存段階でここで落とす
+    duplicate_change_threshold: float = 0.002
     pixel_delta: int = 18
     ignore_regions: list[dict[str, float]] = field(default_factory=list)
     watch_regions: list[dict[str, float]] = field(default_factory=list)

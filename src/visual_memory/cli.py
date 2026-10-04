@@ -38,13 +38,14 @@ def main(argv: list[str] | None = None) -> None:
         return
     settings = load_settings(args.data_dir)
     if args.host:
-        if args.host not in ("127.0.0.1", "localhost", "::1"):
-            raise SystemExit("Refusing to bind outside localhost")
         settings.host = args.host
     if args.port:
         settings.port = args.port
+    if settings.host not in ("127.0.0.1", "localhost", "::1"):
+        raise SystemExit("Refusing to bind outside localhost")
     app = create_app(settings)
-    url = f"http://{settings.host}:{settings.port}/?token={settings.auth_token}"
+    browser_host = "[::1]" if settings.host == "::1" else settings.host
+    url = f"http://{browser_host}:{settings.port}/?token={settings.auth_token}"
     if not args.no_open:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
     print(f"Visual Memory: {url}")

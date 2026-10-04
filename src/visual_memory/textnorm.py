@@ -149,16 +149,19 @@ def line_key(value: str) -> str:
     return normalize_ocr_line(value).casefold()
 
 
-def clean_ocr_lines(
+def filter_ocr_lines(
     lines: Iterable[Mapping[str, Any]],
     height: int,
     repeated_keys: Container[str] | None = None,
-) -> list[str]:
-    """OCRの行データからノイズを除いた行テキストの一覧を返す。
+) -> list[dict[str, Any]]:
+    """OCRの行データからノイズを除き、生き残った行データをそのまま返す。
+
+    :func:`clean_ocr_lines` と判定は同じだが、テキストだけでなく polygon や confidence を
+    保ったまま返す。重要行の選定(文字の大きさや確信度で並べ替える処理)がこれらを必要とする。
 
     Args:
-        lines: ``{"text": str, "polygon": [[x, y], ...]}`` 形式の行データ。
-            polygon は無くてもよい(その場合は位置による判定を行わない)。
+        lines: ``{"text": str, "polygon": [[x, y], ...], "confidence": float}`` 形式の行データ。
+            polygon と confidence は無くてもよい(その場合はその判定を行わない)。
         height: フレームの高さ(px)。0以下なら位置による判定を行わない。
         repeated_keys: 「複数フレームで繰り返し出現する行」の :func:`line_key` 集合。
             呼び出し側が数え方を決める(パック生成はページ群、索引処理は直近フレーム)。
@@ -168,9 +171,12 @@ def clean_ocr_lines(
         2. 同一フレーム内で重複する行
         3. ``repeated_keys`` に含まれ、かつ画面の上端/下端の帯にある行
            (= タスクバーやタイトルバーのように常に同じ位置に出る行)
+
+    Returns:
+        元の行データに、正規化済みのテキストを ``text`` として入れ直した辞書の一覧。
     """
     repeated = repeated_keys if repeated_keys is not None else frozenset()
-    cleaned: list[str] = []
+    cleaned: list[dict[str, Any]] = []
     seen: set[str] = set()
     for line in lines:
         text = normalize_ocr_line(str(line.get("text", "")))
@@ -184,5 +190,18 @@ def clean_ocr_lines(
             if center_y <= OUTER_CHROME_TOP_RATIO or center_y >= OUTER_CHROME_BOTTOM_RATIO:
                 continue
         seen.add(key)
-        cleaned.append(text)
+        cleaned.append({**line, "text": text})
     return cleaned
+
+
+def clean_ocr_lines(
+    lines: Iterable[Mapping[str, Any]],
+    height: int,
+    repeated_keys: Container[str] | None = None,
+) -> list[str]:
+    """OCRの行データからノイズを除いた行テキストの一覧を返す。
+
+    判定の中身は :func:`filter_ocr_lines` と同一で、こちらはテキストだけが欲しい
+    呼び出し側(索引処理など)のための薄いラッパー。
+    """
+    return [line["text"] for line in filter_ocr_lines(lines, height, repeated_keys)]

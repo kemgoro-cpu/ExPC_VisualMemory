@@ -27,6 +27,7 @@
         </label>
         <button id="startCapture" class="primary">記録を開始</button>
         <button id="stopCapture" class="danger">停止</button>
+        <button id="previewToggle" class="ghost">プレビュー</button>
         <button id="regionSettings" class="ghost">差分領域</button>
       </div>
       <div id="previewPanel" class="preview-panel" hidden>
@@ -42,6 +43,7 @@
       </div>
       <div id="systemWarnings" class="warnings"></div>
       <div class="metrics" id="metrics"></div>
+      <p class="muted storage-note">通常の画面履歴は既定30日で整理されます。文書と文書に使った元画像は、この保持期限やMCPの期限切れ・共有停止後も長期保存されます。</p>
     </section>
 
     <section class="workspace">
@@ -58,7 +60,12 @@
           <label class="control-field"><span>終了</span><input id="searchEnd" type="datetime-local"></label>
           <button class="primary" type="submit">検索</button>
         </form>
-        <div id="resultsMeta" class="muted"></div>
+        <div class="results-bar">
+          <div id="resultsMeta" class="muted"></div>
+          <button id="refreshHistory" class="ghost" type="button">履歴を更新</button>
+          <button id="toggleDensity" class="ghost" type="button">表示を絞る</button>
+        </div>
+        <p id="searchNotice" class="muted" role="status"></p>
         <div id="eventGrid" class="event-grid"></div>
         <div class="load-more-wrap"><button id="loadMore" class="ghost" hidden>さらに読み込む</button></div>
       </div>
@@ -76,8 +83,12 @@
         <label>タイトル<input id="packTitle" maxlength="200" placeholder="空欄なら画面から自動作成"></label>
         <label>メモ<textarea id="packNote" rows="4" placeholder="AIに知っておいてほしいこと"></textarea></label>
         <label class="option-check"><input id="deduplicateOverlaps" type="checkbox" checked>連続画面の重複を除去</label>
+        <label class="option-check"><input id="includeAppendix" type="checkbox">PDFにOCR全文を含める（付録を追加）</label>
+        <p class="muted">OFFは画像＋OCR抜粋、ONは認識済みの本文全文を付録に収録します。MCPで全文を使う場合は get_context_pack を利用できます。</p>
         <button id="createPack" class="primary wide">コンテキスト文書を作成</button>
-        <small>{{ pack_warning_images }}枚を超える文書ではサイズ警告を表示します。</small>
+        <button id="startNewPack" class="ghost wide" type="button" hidden>別の文書を作成する</button>
+        <p id="createPackStatus" class="muted" role="status"></p>
+        <small>1文書は最大{{ max_pack_images }}枚。{{ pack_warning_images }}枚を超えるとサイズ警告を表示します。作成完了と同時にMCP共有を開始します。</small>
       </aside>
     </section>
   </main>
@@ -112,6 +123,22 @@
     <div class="dialog-actions">
       <button id="saveRegions" class="primary">領域を保存</button>
     </div>
+  </dialog>
+
+  <dialog id="pagePreviewDialog" class="detail-dialog">
+    <button class="dialog-close" data-close="pagePreviewDialog" aria-label="ページ確認を閉じる">×</button>
+    <h2 id="pagePreviewTitle">文書ページの確認</h2>
+    <img id="pagePreviewImage" class="detail-image" alt="文書ページの拡大画像">
+    <div class="dialog-actions"><button id="previousPage" class="ghost" type="button">前のページ</button><button id="nextPage" class="ghost" type="button">次のページ</button></div>
+  </dialog>
+
+  <dialog id="deletePackDialog" class="packs-dialog">
+    <button class="dialog-close" data-close="deletePackDialog" aria-label="文書削除の確認を閉じる">×</button>
+    <h2>文書を削除</h2>
+    <div id="deletePackSummary"></div>
+    <p class="muted">元画像は長期保存の対象として残します。他の文書とその元画像は削除しません。</p>
+    <div class="dialog-actions"><button id="confirmDeletePack" class="danger" type="button">この文書を削除する</button><button class="ghost" data-close="deletePackDialog" type="button">キャンセル</button></div>
+    <p id="deletePackStatus" role="status"></p>
   </dialog>
 
   <div id="toast" class="toast" role="status"></div>

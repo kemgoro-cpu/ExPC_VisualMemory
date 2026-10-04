@@ -31,7 +31,7 @@ class VisualMemoryService:
         self.settings = settings
         self.db = Database(settings.database_path)
         self.db.initialize()
-        self.storage = Storage(settings)
+        self.storage = Storage(settings, self.db)
         self.ocr = ocr or AsyncOcrProvider(
             lambda: build_ocr_provider(
                 settings.ocr_provider,
@@ -54,6 +54,7 @@ class VisualMemoryService:
             on_session_start=self._session_start,
             on_session_end=self._session_end,
             source_factory=source_factory,
+            lookup_manual_capture=self.processor.manual_capture_status,
         )
         # CPUでのOCR・埋め込みは1枚あたり数十秒かかりCPUを占有するため、既定では記録中は行わず
         # 記録停止後にBackgroundIndexerがまとめて処理する(プレビュー・手動キャプチャの応答性を守るため)。
@@ -123,9 +124,39 @@ class VisualMemoryService:
 
     def status(self) -> dict[str, Any]:
         disk = self.settings.disk_usage()
+        processor = asdict(self.processor.status)
+        capture = asdict(self.capture.status)
+        capture.update(
+            {
+                key: processor.get(key)
+                for key in (
+                    "saved_count",
+                    "last_saved_at",
+                    "last_saved_kind",
+                    "last_saved_event_id",
+                    "last_saved_session_id",
+                    "session_saved_count",
+                )
+            }
+        )
+        if capture.get("session_id") != processor.get("last_saved_session_id"):
+            capture["session_saved_count"] = 0
+        sources = self.db.fetchone("""SELECT
+            COALESCE(SUM(CASE WHEN retained=1 THEN frame_bytes+thumbnail_bytes ELSE 0 END),0)
+                AS retained_source_bytes,
+            COALESCE(SUM(CASE WHEN retained=0 THEN frame_bytes+thumbnail_bytes ELSE 0 END),0)
+                AS history_bytes,
+            COALESCE(SUM(retained=1),0) AS retained_event_count FROM screen_event""")
+        pack_signature = tuple(
+            tuple(row)
+            for row in self.db.fetchall(
+                "SELECT id,artifact_path,manifest_sha256,build_token FROM context_pack ORDER BY id"
+            )
+        )
+        document_bytes = self.storage.document_usage_bytes(pack_signature)
         return {
-            "capture": asdict(self.capture.status),
-            "processor": asdict(self.processor.status),
+            "capture": capture,
+            "processor": processor,
             "indexer": asdict(self.indexer.status),
             "ocr": {
                 "name": self.ocr.name,
@@ -157,6 +188,8 @@ class VisualMemoryService:
                 "minimum_free_bytes": self.settings.minimum_free_bytes,
                 "state": self.storage.usage_state,
                 "last_reconciled_at": self.storage.last_reconciled_at,
+                "document_bytes": document_bytes,
+                **dict(sources),
             },
         }
 
@@ -183,17 +216,18 @@ class VisualMemoryService:
         if end:
             conditions.append("started_at <= ?")
             params.append(end)
-        rows = self.db.fetchall(
-            f"SELECT id,frame_path,thumbnail_path FROM screen_event WHERE {' AND '.join(conditions)}", params
-        )
-        if not rows:
-            return 0
-        ids = [row["id"] for row in rows]
-        placeholders = ",".join("?" for _ in ids)
-        self.db.execute(f"DELETE FROM screen_event WHERE id IN ({placeholders})", ids)
+        with self.db.transaction() as connection:
+            rows = connection.execute(
+                f"SELECT id,frame_path,thumbnail_path FROM screen_event WHERE {' AND '.join(conditions)}",
+                params,
+            ).fetchall()
+            if not rows:
+                return 0
+            connection.executemany("DELETE FROM screen_event WHERE id=?", [(row["id"],) for row in rows])
         self.storage.remove_paths(
             [value for row in rows for value in (row["frame_path"], row["thumbnail_path"])]
         )
+        self.search.invalidate_embedding_cache()
         return len(rows)
 
     def reindex_event(self, event_id: int) -> dict[str, Any]:

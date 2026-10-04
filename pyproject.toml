@@ -32,6 +32,7 @@ dev = [
   "pytest>=8.3,<10",
   "pytest-cov>=6,<8",
   "ruff>=0.8,<1",
+  "pypdf>=5,<8",  # 生成したPDFのテキスト層を読み直す往復テスト用(tests/test_packs.py)
 ]
 build = ["pyinstaller>=6.11,<7"]
 

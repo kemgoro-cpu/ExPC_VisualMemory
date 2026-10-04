@@ -20,6 +20,10 @@ from .imaging import Region, changed_fraction, region_changed_fraction
 
 LOGGER = logging.getLogger(__name__)
 
+# プレビューを自動で止めるまでの秒数。消し忘れてキャプチャーデバイスを掴み続けると
+# 記録も開始できなくなるため、放っておいても必ず解放されるようにしている
+PREVIEW_SECONDS = 30.0
+
 
 def utcnow() -> datetime:
     return datetime.now(UTC)
@@ -36,6 +40,8 @@ class FrameCandidate:
     ended_at: datetime
     change_score: float
     event_kind: str
+    captured_at: datetime | None = None
+    manual_request: ManualCaptureRequest | None = None
 
 
 class ChangeDetector:
@@ -64,6 +70,7 @@ class ChangeDetector:
         self.last_emit_at: float | None = None
         self.last_motion_emit_at: float | None = None
         self.period_started_at: datetime | None = None
+        self.candidate_captured_at: datetime | None = None
         self.peak_change = 0.0
         self.dirty = False
 
@@ -74,7 +81,8 @@ class ChangeDetector:
             self.last_emit_at = monotonic_at
             self.last_motion_emit_at = monotonic_at
             self.period_started_at = captured_at
-            return [FrameCandidate(frame.copy(), captured_at, captured_at, 1.0, "initial")]
+            self.candidate_captured_at = captured_at
+            return [FrameCandidate(frame.copy(), captured_at, captured_at, 1.0, "initial", captured_at)]
 
         score = changed_fraction(self.previous_frame, frame, self.pixel_delta, self.ignore_regions)
         watch_score = max(
@@ -90,10 +98,10 @@ class ChangeDetector:
             starting_motion = not self.dirty
             self.dirty = True
             self.candidate_frame = frame.copy()
+            self.candidate_captured_at = captured_at
             self.last_motion_at = monotonic_at
             self.peak_change = max(self.peak_change, score, watch_score)
-            if self.period_started_at is None:
-                self.period_started_at = captured_at
+            self.period_started_at = captured_at
             if starting_motion:
                 self.last_motion_emit_at = monotonic_at
             if (
@@ -128,12 +136,16 @@ class ChangeDetector:
     def _emit(
         self, frame: np.ndarray, captured_at: datetime, monotonic_at: float, kind: str
     ) -> FrameCandidate:
+        # A stable image was sampled at the last significant change, before the
+        # stability wait ended. Motion/manual/heartbeat images are sampled now.
+        observed_at = (self.candidate_captured_at or captured_at) if kind == "stable" else captured_at
         candidate = FrameCandidate(
             frame=frame.copy(),
-            started_at=self.period_started_at or captured_at,
+            started_at=observed_at,
             ended_at=captured_at,
             change_score=self.peak_change,
             event_kind=kind,
+            captured_at=observed_at,
         )
         self.last_emit_at = monotonic_at
         return candidate
@@ -201,6 +213,10 @@ class FFmpegFrameSource:
         self._stderr_tail = bytearray()
         self._stderr_lock = threading.Lock()
         self._stderr_thread: threading.Thread | None = None
+        # closeは2か所から呼ばれる(停止要求側と、フレーム読み出しループの後始末)。
+        # 先頭のNoneチェックだけでは、両方が同時に通り抜けて片方が後始末済みの
+        # プロセスを触ってしまうため、まとめて排他する
+        self._close_lock = threading.Lock()
 
     def command(self) -> list[str]:
         base = [self.settings.ffmpeg_path, "-hide_banner", "-loglevel", "warning"]
@@ -284,33 +300,54 @@ class FFmpegFrameSource:
         return b"".join(chunks)
 
     def close(self) -> None:
-        if not self.process:
-            return
-        if self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=3)
-        for stream in (self.process.stdout, self.process.stderr):
-            if stream:
-                stream.close()
-        if self._stderr_thread and self._stderr_thread.is_alive():
-            self._stderr_thread.join(timeout=1)
-        self.process = None
-        self._stderr_thread = None
+        with self._close_lock:
+            process = self.process
+            if not process:
+                return
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=3)
+            for stream in (process.stdout, process.stderr):
+                if stream:
+                    stream.close()
+            if self._stderr_thread and self._stderr_thread.is_alive():
+                self._stderr_thread.join(timeout=1)
+            self.process = None
+            self._stderr_thread = None
 
 
-class _ManualCaptureRequest:
-    """手動キャプチャ要求の受け渡し。eventのsetだけでは「保存完了」と「記録停止による解放」を
-    区別できないため、実際に保存要求まで到達したかをfulfilledで示す。"""
+class ManualCaptureRequest:
+    """One idempotent request, completed by durable storage rather than capture."""
 
-    __slots__ = ("event", "fulfilled")
-
-    def __init__(self) -> None:
+    def __init__(self, request_id: str) -> None:
+        self.request_id = request_id
         self.event = threading.Event()
-        self.fulfilled = False
+        self._lock = threading.Lock()
+        self.state = "pending"
+        self.event_id: int | None = None
+        self.error: str | None = None
+
+    def finish(self, *, event_id: int | None = None, error: str | None = None) -> None:
+        with self._lock:
+            if self.state != "pending":
+                return
+            self.event_id = event_id
+            self.error = error
+            self.state = "saved" if event_id is not None and error is None else "failed"
+            self.event.set()
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "request_id": self.request_id,
+                "state": self.state,
+                "event_id": self.event_id,
+                "error": self.error,
+            }
 
 
 @dataclass(slots=True)
@@ -326,6 +363,9 @@ class CaptureStatus:
     candidates_emitted: int = 0
     last_candidate_at: str | None = None
     last_candidate_kind: str | None = None
+    # プレビュー(記録せず映像だけ確認する状態)。off / starting / running
+    preview_state: str = "off"
+    preview_seconds_left: int | None = None
 
 
 class CaptureManager:
@@ -336,12 +376,14 @@ class CaptureManager:
         on_session_start: Callable[[str, str, str], None],
         on_session_end: Callable[[str, str, str | None], None],
         source_factory: Callable[[str], FrameSource] | None = None,
+        lookup_manual_capture: Callable[[str], dict | None] | None = None,
     ):
         self.settings = settings
         self.on_candidate = on_candidate
         self.on_session_start = on_session_start
         self.on_session_end = on_session_end
         self.source_factory = source_factory or (lambda name: FFmpegFrameSource(settings, name))
+        self.lookup_manual_capture = lookup_manual_capture
         self.status = CaptureStatus()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -352,9 +394,82 @@ class CaptureManager:
         self._latest_frame: np.ndarray | None = None
         # 手動キャプチャは別スレッド(APIハンドラ)からの要求をキャプチャスレッドへ橋渡しする
         self._manual_lock = threading.Lock()
-        self._manual_request: _ManualCaptureRequest | None = None
+        self._manual_requests: dict[str, ManualCaptureRequest] = {}
+        self._pending_manual: list[ManualCaptureRequest] = []
+        # プレビューは記録とは別系統のスレッドで動く。デバイスは同時に開けないため排他する
+        self._preview_stop = threading.Event()
+        self._preview_thread: threading.Thread | None = None
+        self._preview_source: FrameSource | None = None
+
+    def is_recording(self) -> bool:
+        return bool(self._thread and self._thread.is_alive())
+
+    def start_preview(self, source_name: str, seconds: float = PREVIEW_SECONDS) -> CaptureStatus:
+        """記録せずに映像だけを表示する。``seconds`` 経過したら自動で止まる。
+
+        セッションを作らず、変化検出も保存も行わない。映像が正しく入っているかを
+        確かめるためだけの状態。
+        """
+        with self._lock:
+            if self.is_recording():
+                raise RuntimeError("Stop capture before starting a preview")
+            if self._preview_thread and self._preview_thread.is_alive():
+                return self.status
+            self._preview_stop.clear()
+            self.status.preview_state = "starting"
+            self.status.preview_seconds_left = int(seconds)
+            self._preview_thread = threading.Thread(
+                target=self._run_preview,
+                args=(source_name, seconds),
+                daemon=True,
+                name="capture-preview",
+            )
+            self._preview_thread.start()
+            return self.status
+
+    def stop_preview(self) -> None:
+        """プレビューを止め、キャプチャーデバイスが解放されるまで待つ。"""
+        self._preview_stop.set()
+        source = self._preview_source
+        if source:
+            source.close()
+        thread = self._preview_thread
+        if thread and thread.is_alive():
+            # 記録開始がこの直後に続くことがあるため、デバイスの解放を待ってから戻る
+            thread.join(timeout=8)
+        self.status.preview_state = "off"
+        self.status.preview_seconds_left = None
+
+    def _run_preview(self, source_name: str, seconds: float) -> None:
+        deadline = time.monotonic() + seconds
+        try:
+            self._preview_source = self.source_factory(source_name)
+            self.status.preview_state = "running"
+            for frame in self._preview_source.frames(self._preview_stop):
+                with self._preview_lock:
+                    self._latest_frame = frame
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self.status.preview_seconds_left = max(0, int(remaining))
+        except Exception as exc:
+            # プレビューは補助機能なので、失敗しても記録状態には影響させない
+            self.status.last_error = str(exc)
+            LOGGER.warning("Preview failed: %s", exc)
+        finally:
+            if self._preview_source:
+                self._preview_source.close()
+                self._preview_source = None
+            with self._preview_lock:
+                self._latest_frame = None
+            self.status.preview_state = "off"
+            self.status.preview_seconds_left = None
 
     def start(self, source_name: str) -> CaptureStatus:
+        # プレビュー中でも記録を開始できるようにする(映像を確認してそのまま記録、が自然なため)。
+        # デバイスは同時に開けないので、先にプレビューを止めて解放を待つ
+        if self._preview_thread and self._preview_thread.is_alive():
+            self.stop_preview()
         with self._lock:
             if self._thread and self._thread.is_alive():
                 raise RuntimeError("Capture is already running")
@@ -389,21 +504,35 @@ class CaptureManager:
             return None
         return encoded.tobytes()
 
-    def request_manual_capture(self, timeout: float = 3.0) -> bool:
-        """記録中のキャプチャスレッドへ即時保存を要求し、完了(またはタイムアウト)まで待つ。
-
-        タイムアウトした場合や、待機中に記録が停止した場合はFalseを返す。
-        """
-        if self.status.state not in {"running", "reconnecting", "starting"}:
-            raise RuntimeError("Capture is not running")
+    def manual_capture_status(self, request_id: str) -> dict | None:
         with self._manual_lock:
-            request = self._manual_request
+            request = self._manual_requests.get(request_id)
+        if request is not None:
+            return request.snapshot()
+        return self.lookup_manual_capture(request_id) if self.lookup_manual_capture else None
+
+    def request_manual_capture(self, timeout: float = 3.0, *, request_id: str | None = None) -> bool | dict:
+        """Wait for storage; a timeout leaves a queryable pending request.
+
+        Explicit request IDs return structured results and coalesce retries.
+        The legacy no-ID form returns True only after actual storage succeeds.
+        """
+        structured = request_id is not None
+        request_id = request_id or str(uuid.uuid4())
+        known = self.manual_capture_status(request_id)
+        if known is not None and known["state"] != "pending":
+            return known if structured else known["state"] == "saved"
+        with self._manual_lock:
+            request = self._manual_requests.get(request_id)
             if request is None:
-                request = _ManualCaptureRequest()
-                self._manual_request = request
-        if not request.event.wait(timeout):
-            return False
-        return request.fulfilled
+                if self.status.state not in {"running", "reconnecting", "starting"} or self._stop.is_set():
+                    raise RuntimeError("Capture is not running")
+                request = ManualCaptureRequest(request_id)
+                self._manual_requests[request_id] = request
+                self._pending_manual.append(request)
+        request.event.wait(timeout)
+        result = request.snapshot()
+        return result if structured else result["state"] == "saved"
 
     def _run(self, source_name: str) -> None:
         session_id = str(uuid.uuid4())
@@ -412,7 +541,14 @@ class CaptureManager:
         self.status.candidates_emitted = 0
         self.status.last_candidate_at = None
         self.status.last_candidate_kind = None
-        self.on_session_start(session_id, source_name, iso(utcnow()))
+        try:
+            self.on_session_start(session_id, source_name, iso(utcnow()))
+        except Exception as exc:
+            self.status.last_error = str(exc)
+            self.status.state = "failed"
+            self._release_pending_manual_request()
+            LOGGER.exception("Unable to create capture session")
+            return
         detector = ChangeDetector(
             stable_seconds=self.settings.stable_seconds,
             heartbeat_seconds=self.settings.heartbeat_seconds,
@@ -438,19 +574,20 @@ class CaptureManager:
                         with self._preview_lock:
                             self._latest_frame = frame
                         candidates = detector.push(frame, time.monotonic(), stamp)
-                        manual_request = self._take_manual_request()
-                        if manual_request is not None:
-                            candidates = [
-                                *candidates,
-                                FrameCandidate(frame.copy(), stamp, stamp, 0.0, "manual"),
-                            ]
-                        for candidate in candidates:
-                            accepted = self.on_candidate(session_id, candidate)
+                        for request in self._take_manual_requests():
+                            candidates.append(
+                                FrameCandidate(frame.copy(), stamp, stamp, 0.0, "manual", stamp, request)
+                            )
+                        for position, candidate in enumerate(candidates):
+                            try:
+                                accepted = self.on_candidate(session_id, candidate)
+                            except Exception as exc:
+                                for remaining in candidates[position:]:
+                                    if remaining.manual_request:
+                                        remaining.manual_request.finish(error=str(exc))
+                                raise
                             if not accepted:
                                 self.status.queue_drops += 1
-                            if candidate.event_kind == "manual":
-                                manual_request.fulfilled = True
-                                manual_request.event.set()
                             self.status.candidates_emitted += 1
                             self.status.last_candidate_at = iso(stamp)
                             self.status.last_candidate_kind = candidate.event_kind
@@ -476,17 +613,12 @@ class CaptureManager:
             self.on_session_end(session_id, iso(utcnow()), terminal_error)
             self.status.state = "stopped"
 
-    def _take_manual_request(self) -> _ManualCaptureRequest | None:
+    def _take_manual_requests(self) -> list[ManualCaptureRequest]:
         with self._manual_lock:
-            request = self._manual_request
-            self._manual_request = None
-            return request
+            requests = self._pending_manual
+            self._pending_manual = []
+            return requests
 
     def _release_pending_manual_request(self) -> None:
-        # 記録が止まる際、待機中の手動キャプチャ要求があれば解放してAPI側のタイムアウト待ちを避ける。
-        # fulfilledは立てないため、API側は保存失敗として扱える
-        with self._manual_lock:
-            request = self._manual_request
-            self._manual_request = None
-        if request is not None:
-            request.event.set()
+        for request in self._take_manual_requests():
+            request.finish(error="Capture stopped before a frame was submitted")

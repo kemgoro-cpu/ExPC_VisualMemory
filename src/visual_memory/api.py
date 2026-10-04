@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import secrets
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -88,12 +89,28 @@ class CaptureRequest(BaseModel):
     source_name: str = Field(min_length=1, max_length=300)
 
 
+class ManualCaptureRequest(BaseModel):
+    request_id: str = Field(
+        default_factory=lambda: uuid.uuid4().hex, min_length=1, max_length=100, pattern=r"^[A-Za-z0-9_-]+$"
+    )
+
+
+class RebuildPackRequest(BaseModel):
+    deduplicate_overlaps: bool
+    include_appendix: bool
+
+
 class CreatePackRequest(BaseModel):
     title: str = Field(default="", max_length=200)
     query: str = Field(default="", max_length=1000)
     note: str = Field(default="", max_length=10000)
     event_ids: list[int]
     deduplicate_overlaps: bool = True
+    include_appendix: bool = False
+
+
+class RemovePagesRequest(BaseModel):
+    positions: list[int]
 
 
 class RegionShape(BaseModel):
@@ -131,7 +148,10 @@ def create_app(settings: Settings | None = None, service: VisualMemoryService | 
 
     @app.exception_handler(PackError)
     async def pack_error_handler(_: Request, exc: PackError):
-        return JSONResponse({"detail": str(exc)}, status_code=400)
+        payload = {"detail": str(exc)}
+        if getattr(exc, "pack_id", None):
+            payload["pack_id"] = exc.pack_id
+        return JSONResponse(payload, status_code=400)
 
     @app.get("/health")
     def health():
@@ -180,9 +200,28 @@ def create_app(settings: Settings | None = None, service: VisualMemoryService | 
         service.capture.stop()
         return {"state": "stopped"}
 
+    @app.post("/api/capture/preview/start")
+    def capture_preview_start(payload: CaptureRequest):
+        try:
+            service.capture.start_preview(payload.source_name)
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return {"state": service.capture.status.preview_state}
+
+    @app.post("/api/capture/preview/stop")
+    def capture_preview_stop():
+        service.capture.stop_preview()
+        return {"state": "off"}
+
     @app.get("/api/capture/preview")
     def capture_preview():
-        if service.capture.status.state not in {"running", "reconnecting", "starting"}:
+        # 記録中に加え、プレビュー中も映像を返す
+        previewing = service.capture.status.preview_state in {"starting", "running"}
+        if not previewing and service.capture.status.state not in {
+            "running",
+            "reconnecting",
+            "starting",
+        }:
             raise HTTPException(409, "Capture is not running")
         payload = service.capture.latest_frame_jpeg()
         if payload is None:
@@ -198,14 +237,19 @@ def create_app(settings: Settings | None = None, service: VisualMemoryService | 
         )
 
     @app.post("/api/capture/manual")
-    def capture_manual():
+    def capture_manual(payload: ManualCaptureRequest | None = None):
+        payload = payload or ManualCaptureRequest()
         try:
-            fulfilled = service.capture.request_manual_capture()
+            return service.capture.request_manual_capture(request_id=payload.request_id)
         except RuntimeError as exc:
             raise HTTPException(409, str(exc)) from exc
-        if not fulfilled:
-            raise HTTPException(504, "Manual capture was not completed (timed out or capture stopped)")
-        return {"state": "captured"}
+
+    @app.get("/api/capture/manual/{request_id}")
+    def manual_capture_status(request_id: str):
+        result = service.capture.manual_capture_status(request_id)
+        if result is None:
+            raise HTTPException(404, "Manual capture request not found")
+        return result
 
     @app.get("/api/capture/regions")
     def capture_regions():
@@ -266,6 +310,8 @@ def create_app(settings: Settings | None = None, service: VisualMemoryService | 
             "has_more": has_more,
             "next_offset": offset + len(results),
             "total": service.search.timeline_count(start, end) if not q.strip() else None,
+            "search_limited": bool(q.strip()),
+            "candidate_limit": 200 if q.strip() else None,
         }
 
     @app.get("/api/events/{event_id}")
@@ -317,6 +363,7 @@ def create_app(settings: Settings | None = None, service: VisualMemoryService | 
             payload.query,
             payload.note,
             payload.deduplicate_overlaps,
+            payload.include_appendix,
         )
 
     @app.get("/api/packs/{pack_id}")
@@ -331,11 +378,32 @@ def create_app(settings: Settings | None = None, service: VisualMemoryService | 
     def revoke_pack(pack_id: str):
         return service.packs.revoke(pack_id)
 
+    @app.post("/api/packs/{pack_id}/rebuild")
+    def rebuild_pack(pack_id: str, payload: RebuildPackRequest):
+        return service.packs.configure_and_rebuild(pack_id, **payload.model_dump())
+
+    @app.get("/api/packs/{pack_id}/deletion-preview")
+    def pack_deletion_preview(pack_id: str):
+        return service.packs.deletion_info(pack_id)
+
+    @app.delete("/api/packs/{pack_id}")
+    def delete_pack(pack_id: str, confirm: bool = False):
+        if not confirm:
+            raise HTTPException(400, "confirm=true is required")
+        return service.packs.delete(pack_id)
+
+    @app.get("/api/packs/{pack_id}/pages/{position}/image")
+    def pack_page_image(pack_id: str, position: int):
+        return FileResponse(service.packs.page_image_path(pack_id, position), media_type="image/webp")
+
+    @app.delete("/api/packs/{pack_id}/pages")
+    def delete_pack_pages(pack_id: str, payload: RemovePagesRequest):
+        return service.packs.remove_pages(pack_id, payload.positions)
+
     @app.get("/api/packs/{pack_id}/document")
-    def export_pack_document(
-        pack_id: str, document_format: str = Query(default="pdf", alias="format")
-    ):
+    def export_pack_document(pack_id: str, document_format: str = Query(default="pdf", alias="format")):
         path = service.packs.export_document(pack_id, document_format)
+        service.storage.invalidate_document_usage()
         media_type = "application/pdf" if path.suffix == ".pdf" else "text/html; charset=utf-8"
         return FileResponse(
             path,

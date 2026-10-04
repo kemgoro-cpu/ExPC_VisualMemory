@@ -132,3 +132,47 @@ def test_initialize_migrates_unicode61_fts_and_rebuilds_existing_rows(service):
     )["sql"]
     assert "trigram" in definition.lower()
     assert service.search.search("燃料噴射")[0]["id"] == event_id
+
+
+def test_short_only_query_uses_or_like_mixed_queries(service):
+    first = add_event(service, "会議について", seconds=1)
+    second = add_event(service, "資料について", seconds=2)
+    unrelated = add_event(service, "unrelated", seconds=3)
+    ids = {int(row["id"]) for row in service.search._exact("会議 資料", None, None, 50)}
+    assert ids == {first, second}
+    assert unrelated not in ids
+
+
+def test_warm_semantic_cache_observes_heartbeat_without_reloading_vectors(service, monkeypatch):
+    event_id = add_event(service, "unique semantic evidence", seconds=1)
+    service.search._semantic("evidence", None, None, 10)
+    matrix = service.search._cache_matrix
+    service.db.execute(
+        "UPDATE screen_event SET ended_at=? WHERE id=?",
+        (
+            "2026-01-01T00:02:00+00:00",
+            event_id,
+        ),
+    )
+    original = service.db.fetchall
+    queries = []
+
+    def record(sql, params=()):
+        queries.append(sql)
+        return original(sql, params)
+
+    monkeypatch.setattr(service.db, "fetchall", record)
+    rows = service.search._semantic("evidence", "2026-01-01T00:01:00+00:00", None, 10)
+    assert [row["id"] for row in rows] == [event_id]
+    assert rows[0]["ended_at"] == "2026-01-01T00:02:00+00:00"
+    assert service.search._cache_matrix is matrix
+    assert not any("SELECT id,embedding FROM" in sql for sql in queries)
+
+
+def test_neighbors_and_pagination_include_events_with_identical_times(service):
+    ids = [add_event(service, f"event {i}", seconds=1) for i in range(5)]
+    detail = service.search.event_with_neighbors(ids[2])
+    assert [row["id"] for row in detail["before"]] == ids[:2]
+    assert [row["id"] for row in detail["after"]] == ids[3:]
+    rows = service.search.search(limit=2) + service.search.search(limit=3, offset=2)
+    assert [row["id"] for row in rows] == list(reversed(ids))

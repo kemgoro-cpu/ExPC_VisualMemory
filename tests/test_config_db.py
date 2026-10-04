@@ -59,9 +59,7 @@ def _make_pre_clean_column_database(path: Path, ocr_text: str) -> Database:
 
 
 def _fts_hits(database: Database, query: str) -> int:
-    rows = database.fetchall(
-        "SELECT rowid FROM screen_event_fts WHERE screen_event_fts MATCH ?", (query,)
-    )
+    rows = database.fetchall("SELECT rowid FROM screen_event_fts WHERE screen_event_fts MATCH ?", (query,))
     return len(rows)
 
 
@@ -89,9 +87,7 @@ def test_migration_is_idempotent(tmp_path):
 
 def test_clean_column_update_refreshes_the_full_text_index(tmp_path):
     # バックフィルは ocr_text_clean を更新するだけでFTSが追従する(トリガー任せ)
-    database = _make_pre_clean_column_database(
-        tmp_path / "trigger.sqlite3", "エクスプローラー\n本文です"
-    )
+    database = _make_pre_clean_column_database(tmp_path / "trigger.sqlite3", "エクスプローラー\n本文です")
     database.initialize()
     assert _fts_hits(database, "エクスプローラー") == 1
 
@@ -141,3 +137,46 @@ def test_initialize_closes_its_database_connection(tmp_path, monkeypatch):
     database.initialize()
 
     assert closed is True
+
+
+def test_migration_classifies_legacy_ocr_without_inventing_capture_times(service):
+    from conftest import add_event
+
+    ids = [add_event(service, "", seconds=i) for i in range(5)]
+    service.db.execute("DELETE FROM evidence WHERE kind='ocr'")
+    for event_id, provider in zip(ids[:2], ["disabled", "paddle"], strict=True):
+        service.db.execute(
+            "INSERT INTO evidence(event_id,kind,metadata_json,created_at) VALUES(?,'ocr',?,?)",
+            (
+                event_id,
+                json.dumps({"provider": provider}),
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+    service.db.execute("UPDATE screen_event SET processed_at=NULL WHERE id=?", (ids[3],))
+    for provider in ("disabled", "paddle"):
+        service.db.execute(
+            "INSERT INTO evidence(event_id,kind,metadata_json,created_at) VALUES(?,'ocr',?,?)",
+            (ids[4], json.dumps({"provider": provider}), "2026-01-01T00:00:00+00:00"),
+        )
+    pack = service.packs.create("legacy", [ids[0]])
+    artifact = Path(pack["artifact_path"])
+    manifest = (artifact / "manifest.json").read_bytes()
+    with service.db.transaction() as connection:
+        connection.execute("DROP INDEX idx_event_indexing")
+        connection.execute("ALTER TABLE screen_event DROP COLUMN indexing_state")
+        connection.execute("ALTER TABLE screen_event DROP COLUMN captured_at")
+        connection.execute("ALTER TABLE screen_event DROP COLUMN retained")
+    service.db.initialize()
+    service.db.initialize()
+    rows = service.db.fetchall("SELECT * FROM screen_event ORDER BY id")
+    assert [row["indexing_state"] for row in rows] == [
+        "blocked",
+        "ready",
+        "legacy-unknown",
+        "pending",
+        "ready",
+    ]
+    assert all(row["captured_at"] is None for row in rows)
+    assert rows[0]["retained"] == 1
+    assert (artifact / "manifest.json").read_bytes() == manifest
